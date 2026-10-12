@@ -1,3 +1,4 @@
+"""Offline Hindi audiobook Telegram bot using Piper TTS."""
 import asyncio
 import logging
 import os
@@ -5,10 +6,10 @@ import re
 import shutil
 import tempfile
 import time
+import wave
 from pathlib import Path
 
-import edge_tts
-from gtts import gTTS
+from piper import PiperVoice
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -21,22 +22,15 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 LOCAL_API = os.getenv("LOCAL_API_URL", "").rstrip("/")
+MODEL_PATH = Path(os.getenv("PIPER_MODEL", "/app/models/hi_IN-priyamvada-medium.onnx"))
+CONFIG_PATH = Path(os.getenv("PIPER_CONFIG", "/app/models/hi_IN-priyamvada-medium.onnx.json"))
+CHUNK_CHARS = max(300, int(os.getenv("CHUNK_CHARS", "1000")))
 BITRATE_KBPS = 48
-PERFORMER = "AudioBook Pro"
-
-CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "1000"))
-CONCURRENCY = max(1, int(os.getenv("TTS_CONCURRENCY", "1")))
-TTS_RETRIES = max(1, int(os.getenv("TTS_RETRIES", "3")))
-TTS_TIMEOUT_SECONDS = int(os.getenv("TTS_TIMEOUT_SECONDS", "75"))
-
-if LOCAL_API:
-    MAX_PART_BYTES = 2_000_000_000
-    MAX_DOWNLOAD_BYTES = 2_000_000_000
-else:
-    MAX_PART_BYTES = 50_000_000
-    MAX_DOWNLOAD_BYTES = 20_000_000
-
-MAX_PART_SECONDS = MAX_PART_BYTES * 0.97 / (BITRATE_KBPS * 1000 / 8)
+PERFORMER = "Offline Hindi Audiobook"
+SAFETY = 0.96
+MAX_PART_BYTES = 2_000_000_000 if LOCAL_API else 50_000_000
+MAX_DOWNLOAD_BYTES = 2_000_000_000 if LOCAL_API else 20_000_000
+MAX_PART_SECONDS = MAX_PART_BYTES * SAFETY / (BITRATE_KBPS * 1000 / 8)
 
 if LOCAL_API:
     MAX_PART_SECONDS = min(
@@ -44,18 +38,33 @@ if LOCAL_API:
         int(os.getenv("PART_MINUTES", "180")) * 60,
     )
 
-VOICES = {
-    "hi_m": ("🇮🇳 Hindi - Madhur (M)", "hi-IN-MadhurNeural"),
-    "hi_f": ("🇮🇳 Hindi - Swara (F)", "hi-IN-SwaraNeural"),
-    "en_m": ("🇬🇧 English - Guy (M)", "en-US-GuyNeural"),
-    "en_f": ("🇺🇸 English - Aria (F)", "en-US-AriaNeural"),
-}
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("ttsbot")
+log = logging.getLogger("piper-audiobook")
+
+VOICE_LABEL = "🇮🇳 Hindi Female — Priyamvada (Offline)"
+_piper_voice = None
+
+
+def get_voice():
+    global _piper_voice
+
+    if _piper_voice is None:
+        if not MODEL_PATH.exists() or not CONFIG_PATH.exists():
+            raise RuntimeError(
+                f"Piper model files missing: {MODEL_PATH} and {CONFIG_PATH}"
+            )
+
+        log.info("Loading offline Piper voice model: %s", MODEL_PATH.name)
+        _piper_voice = PiperVoice.load(
+            str(MODEL_PATH),
+            config_path=str(CONFIG_PATH),
+        )
+        log.info("Piper voice model loaded")
+
+    return _piper_voice
 
 
 def fmt_clock(seconds):
@@ -83,6 +92,7 @@ def progress_bar(percent, width=12):
 
 
 def split_text(text, limit=CHUNK_CHARS):
+    text = text.replace("\x00", " ")
     text = re.sub(r"[ \t]+", " ", text)
     sentences = re.split(r"(?<=[।.!?\n])\s*", text)
 
@@ -96,7 +106,7 @@ def split_text(text, limit=CHUNK_CHARS):
 
         while len(sentence) > limit:
             cut = sentence.rfind(" ", 0, limit)
-            if cut <= 0:
+            if cut < 1:
                 cut = limit
 
             if current:
@@ -105,6 +115,9 @@ def split_text(text, limit=CHUNK_CHARS):
 
             chunks.append(sentence[:cut].strip())
             sentence = sentence[cut:].strip()
+
+        if not sentence:
+            continue
 
         if len(current) + len(sentence) + 1 > limit:
             if current:
@@ -119,227 +132,242 @@ def split_text(text, limit=CHUNK_CHARS):
     return [chunk for chunk in chunks if chunk.strip()]
 
 
-async def run_command(*command):
+async def run(*cmd):
     process = await asyncio.create_subprocess_exec(
-        *command,
+        *map(str, cmd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-
     stdout, stderr = await process.communicate()
 
-    if process.returncode != 0:
-        raise RuntimeError(
-            stderr.decode(errors="ignore")[-1000:]
-        )
+    if process.returncode:
+        raise RuntimeError(stderr.decode(errors="replace")[-1800:])
 
-    return stdout.decode(errors="ignore").strip()
+    return stdout.decode(errors="replace").strip()
 
 
 async def audio_duration(path):
-    result = await run_command(
+    result = await run(
         "ffprobe",
         "-v", "error",
         "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(path),
+        "-of", "default=nw=1:nk=1",
+        path,
     )
     return float(result)
 
 
-async def google_tts_chunk(text, output, rate):
-    """
-    gTTS fallback. Public Google TTS may return HTTP 429.
-    Retries with backoff, but availability is not guaranteed.
-    """
-    language = (
-        "hi"
-        if any("\u0900" <= char <= "\u097f" for char in text)
-        else "en"
+def synthesize_wav(text, wav_path):
+    """Generate speech locally using Piper."""
+    voice = get_voice()
+
+    with wave.open(str(wav_path), "wb") as wav_file:
+        voice.synthesize(text, wav_file)
+
+
+async def tts_chunk(text, wav_path, mp3_path, rate):
+    wav_path.unlink(missing_ok=True)
+    mp3_path.unlink(missing_ok=True)
+
+    await asyncio.to_thread(synthesize_wav, text, wav_path)
+
+    if not wav_path.exists() or wav_path.stat().st_size < 256:
+        raise RuntimeError("Piper ne khaali WAV banayi")
+
+    await run(
+        "ffmpeg", "-y",
+        "-i", wav_path,
+        "-vn",
+        "-filter:a", f"atempo={rate:.1f}",
+        "-ac", "1",
+        "-ar", "24000",
+        "-b:a", f"{BITRATE_KBPS}k",
+        mp3_path,
     )
 
-    raw_output = output.with_name(output.stem + "_raw.mp3")
-    retry_delays = [30, 60, 120, 180]
-    last_error = None
+    wav_path.unlink(missing_ok=True)
 
-    for attempt in range(len(retry_delays) + 1):
-        output.unlink(missing_ok=True)
-        raw_output.unlink(missing_ok=True)
-
-        try:
-            def generate():
-                gTTS(
-                    text=text,
-                    lang=language,
-                    slow=False,
-                ).save(str(raw_output))
-
-            await asyncio.wait_for(
-                asyncio.to_thread(generate),
-                timeout=180,
-            )
-
-            if (
-                not raw_output.exists()
-                or raw_output.stat().st_size <= 256
-            ):
-                raise RuntimeError("gTTS returned empty audio")
-
-            await asyncio.wait_for(
-                run_command(
-                    "ffmpeg",
-                    "-y",
-                    "-i", str(raw_output),
-                    "-vn",
-                    "-filter:a", f"atempo={rate:.1f}",
-                    "-b:a", f"{BITRATE_KBPS}k",
-                    "-ac", "1",
-                    "-ar", "24000",
-                    str(output),
-                ),
-                timeout=180,
-            )
-
-            if output.exists() and output.stat().st_size > 256:
-                raw_output.unlink(missing_ok=True)
-                return
-
-            raise RuntimeError("Fallback MP3 is empty")
-
-        except asyncio.CancelledError:
-            output.unlink(missing_ok=True)
-            raw_output.unlink(missing_ok=True)
-            raise
-
-        except Exception as error:
-            last_error = error
-            output.unlink(missing_ok=True)
-            raw_output.unlink(missing_ok=True)
-
-            log.warning(
-                "gTTS fallback failed, attempt %s/%s: %r",
-                attempt + 1,
-                len(retry_delays) + 1,
-                error,
-            )
-
-            if attempt < len(retry_delays):
-                await asyncio.sleep(retry_delays[attempt])
-
-    raise RuntimeError(
-        f"gTTS fallback failed after retries: {last_error!r}"
-    )
-
-
-async def tts_chunk(text, voice, output, semaphore, rate):
-    async with semaphore:
-        output.unlink(missing_ok=True)
-
-        try:
-            edge_rate = f"+{int((rate - 1) * 100)}%"
-
-            communicator = edge_tts.Communicate(
-                text,
-                voice,
-                rate=edge_rate,
-            )
-
-            await asyncio.wait_for(
-                communicator.save(str(output)),
-                timeout=TTS_TIMEOUT_SECONDS,
-            )
-
-            if output.exists() and output.stat().st_size > 256:
-                return
-
-            raise RuntimeError("Edge TTS returned empty audio")
-
-        except asyncio.CancelledError:
-            output.unlink(missing_ok=True)
-            raise
-
-        except Exception as error:
-            output.unlink(missing_ok=True)
-            log.warning(
-                "Edge TTS failed; switching to gTTS: %r",
-                error,
-            )
-
-        await google_tts_chunk(text, output, rate)
+    if not mp3_path.exists() or mp3_path.stat().st_size < 256:
+        raise RuntimeError("FFmpeg ne khaali MP3 banayi")
 
 
 async def concat_mp3(files, output):
-    list_file = output.with_suffix(".concat.txt")
-
-    # Escape apostrophes for FFmpeg concat-list syntax.
+    listing = output.with_suffix(".concat.txt")
     lines = []
-    for file in files:
-        path_text = file.resolve().as_posix().replace("'", "'\\''")
-        lines.append(f"file '{path_text}'\n")
 
-    list_file.write_text("".join(lines), encoding="utf-8")
+    for file in files:
+        safe = file.resolve().as_posix().replace("'", "'\\''")
+        lines.append(f"file '{safe}'\n")
+
+    listing.write_text("".join(lines), encoding="utf-8")
 
     try:
-        await run_command(
-            "ffmpeg",
-            "-y",
+        await run(
+            "ffmpeg", "-y",
             "-f", "concat",
             "-safe", "0",
-            "-i", str(list_file),
+            "-i", listing,
             "-c:a", "libmp3lame",
             "-b:a", f"{BITRATE_KBPS}k",
             "-ac", "1",
             "-ar", "24000",
-            str(output),
+            output,
         )
     finally:
-        list_file.unlink(missing_ok=True)
+        listing.unlink(missing_ok=True)
+
+
+# --------------------------------------------------
+# START MESSAGE + DEMO VOICE
+# --------------------------------------------------
+
+DEMO_TEXT = (
+    "नमस्ते! यह हिंदी फीमेल आवाज़ का डेमो है। "
+    "इस ऑडियोबुक बॉट में आप टेक्स्ट फ़ाइल को MP3 में बदल सकते हैं "
+    "और अपनी पसंद से एक से दो गुना तक स्पीड चुन सकते हैं।"
+)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Namaste!\n\n"
-        "Mujhe ek .txt file bhejo.\n"
-        "Main use MP3 audiobook mein convert karunga.\n\n"
-        "1. TXT file bhejo\n"
-        "2. Voice choose karo\n"
-        "3. Speed choose karo\n"
-        "4. Audiobook parts receive karo 🎧"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔊 Demo Voice सुनें",
+                callback_data="demo",
+            )
+        ],
+    ])
+
+    await update.effective_message.reply_text(
+        "👋 Namaste! Offline Hindi Female Audiobook Bot\n\n"
+        "🔊 पहले Demo Voice दबाकर आवाज़ सुन सकते हो।\n"
+        "फिर अपनी .txt file भेजो और 1.0x से 2.0x speed चुनो।\n\n"
+        "Speech local Piper model से generate होगी; "
+        "Edge TTS/Google gTTS की जरूरत नहीं है।",
+        reply_markup=keyboard,
     )
 
 
-async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    document = update.message.document
+async def send_demo_voice(chat_id, context, status):
+    """Create and send a short Hindi female sample."""
+    work = Path(tempfile.mkdtemp(prefix="piper_demo_"))
+    wav_path = work / "demo.wav"
+    mp3_path = work / "Hindi_Female_Demo.mp3"
 
-    if not document.file_name.lower().endswith(".txt"):
-        await update.message.reply_text(
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(synthesize_wav, DEMO_TEXT, wav_path),
+            timeout=180,
+        )
+
+        await asyncio.wait_for(
+            run(
+                "ffmpeg", "-y",
+                "-i", wav_path,
+                "-vn",
+                "-ac", "1",
+                "-ar", "24000",
+                "-b:a", f"{BITRATE_KBPS}k",
+                mp3_path,
+            ),
+            timeout=120,
+        )
+
+        if not mp3_path.exists() or mp3_path.stat().st_size < 256:
+            raise RuntimeError("Demo MP3 खाली बनी")
+
+        duration = await audio_duration(mp3_path)
+
+        with mp3_path.open("rb") as audio:
+            await context.bot.send_audio(
+                chat_id=chat_id,
+                audio=audio,
+                title="Hindi Female Voice Demo",
+                performer=PERFORMER,
+                duration=int(duration),
+                caption=(
+                    "🔊 Hindi Female — Priyamvada (Offline)\n"
+                    f"🎧 Duration: {fmt_clock(duration)}\n"
+                    "⚡ Demo speed: 1.0x"
+                ),
+                filename="Hindi_Female_Demo.mp3",
+                read_timeout=180,
+                write_timeout=180,
+                connect_timeout=60,
+            )
+
+        await status.edit_text(
+            "✅ Demo voice भेज दी है। अब अपनी .txt file भेजो।"
+        )
+
+    except Exception as exc:
+        log.exception("Demo voice generation failed")
+        await status.edit_text(
+            f"❌ Demo voice error: {str(exc)[:1000]}"
+        )
+
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+async def demo_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Demo voice बना रहा हूँ…")
+
+    status = await query.message.reply_text(
+        "🔊 Hindi female demo voice generate हो रही है…"
+    )
+
+    await send_demo_voice(
+        query.message.chat_id,
+        context,
+        status,
+    )
+
+
+async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = await update.effective_message.reply_text(
+        "🔊 Demo voice generate हो रही है…"
+    )
+
+    await send_demo_voice(
+        update.effective_chat.id,
+        context,
+        status,
+    )
+
+
+# --------------------------------------------------
+# TXT FILE HANDLING
+# --------------------------------------------------
+
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.effective_message.document
+
+    if not doc or not (doc.file_name or "").lower().endswith(".txt"):
+        await update.effective_message.reply_text(
             "❌ Sirf .txt file bhejo."
         )
         return
 
-    if (
-        document.file_size
-        and document.file_size > MAX_DOWNLOAD_BYTES
-    ):
-        await update.message.reply_text(
-            "❌ File limit se badi hai: "
-            f"{MAX_DOWNLOAD_BYTES // 1_000_000} MB."
+    if doc.file_size and doc.file_size > MAX_DOWNLOAD_BYTES:
+        await update.effective_message.reply_text(
+            f"❌ File limit {MAX_DOWNLOAD_BYTES // 1_000_000} MB hai."
         )
         return
 
-    previous_job = context.user_data.get("job")
-    if previous_job:
-        await update.message.reply_text(
-            "⚠️ Tumhari pichhli file ka selection abhi pending hai. "
+    if context.user_data.get("job"):
+        await update.effective_message.reply_text(
+            "⚠️ Pehli file ka selection pending hai. "
             "Pehle uska process complete karo."
         )
         return
 
-    work = Path(tempfile.mkdtemp(prefix="tts_"))
-    input_path = work / "input.txt"
+    work = Path(tempfile.mkdtemp(prefix="piper_tts_"))
 
     try:
-        telegram_file = await context.bot.get_file(document.file_id)
+        telegram_file = await context.bot.get_file(doc.file_id)
+        input_path = work / "input.txt"
         await telegram_file.download_to_drive(input_path)
 
         text = input_path.read_text(
@@ -349,75 +377,47 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not text.strip():
             shutil.rmtree(work, ignore_errors=True)
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "❌ TXT file khaali hai."
             )
             return
 
         context.user_data["job"] = {
-            "dir": str(work),
-            "path": str(input_path),
-            "name": Path(document.file_name).stem,
+            "dir": work,
+            "path": input_path,
+            "name": Path(doc.file_name).stem,
         }
+
+        rates = [
+            [1.0, 1.1, 1.2, 1.3],
+            [1.4, 1.5, 1.6, 1.7],
+            [1.8, 1.9, 2.0],
+        ]
 
         keyboard = [
             [
                 InlineKeyboardButton(
-                    label,
-                    callback_data=f"v:{key}",
+                    f"⚡ {rate:.1f}x",
+                    callback_data=f"r:{rate:.1f}",
                 )
+                for rate in row
             ]
-            for key, (label, voice_id) in VOICES.items()
+            for row in rates
         ]
 
-        await update.message.reply_text(
-            f"📘 {document.file_name} receive ho gayi.\n"
-            "Voice choose karo:",
+        await update.effective_message.reply_text(
+            f"📘 {doc.file_name} receive ho gayi.\n"
+            f"🎙 Voice: {VOICE_LABEL}\n\n"
+            "Playback speed choose karo:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
-    except Exception as error:
+    except Exception as exc:
         shutil.rmtree(work, ignore_errors=True)
-        log.exception("File download failed")
-        await update.message.reply_text(
-            f"❌ File download/read error: {error}"
+        log.exception("TXT download failed")
+        await update.effective_message.reply_text(
+            f"❌ File read error: {str(exc)[:700]}"
         )
-
-
-async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    job = context.user_data.get("job")
-    if not job:
-        await query.edit_message_text(
-            "File expire ho gayi. TXT dobara bhejo."
-        )
-        return
-
-    voice_key = query.data.split(":", 1)[1]
-    if voice_key not in VOICES:
-        await query.edit_message_text("Invalid voice.")
-        return
-
-    context.user_data["selected_voice"] = VOICES[voice_key][1]
-
-    rates = [round(1.0 + index * 0.1, 1) for index in range(11)]
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                f"{rate:.1f}x",
-                callback_data=f"r:{rate:.1f}",
-            )
-            for rate in rates[index:index + 3]
-        ]
-        for index in range(0, len(rates), 3)
-    ]
-
-    await query.edit_message_text(
-        "⚡ Playback speed choose karo:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
 
 
 async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -425,226 +425,166 @@ async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     job = context.user_data.get("job")
-    voice = context.user_data.get("selected_voice")
 
-    if not job or not voice:
+    if not job:
         await query.edit_message_text(
-            "File/voice selection expire ho gayi. TXT dobara bhejo."
+            "File selection expire ho gayi. TXT dobara bhejo."
         )
         return
 
     try:
         rate = float(query.data.split(":", 1)[1])
+
         if not 1.0 <= rate <= 2.0:
-            raise ValueError("Invalid speed")
-    except ValueError:
+            raise ValueError("Invalid rate")
+
+    except Exception:
         await query.edit_message_text("Invalid speed selection.")
         return
 
-    await query.edit_message_text(
-        f"🎧 Voice select ho gayi.\n"
-        f"⚡ Speed: {rate:.1f}x\n"
-        "Audiobook process start ho raha hai..."
+    context.user_data["job"] = None
+
+    status = await query.edit_message_text(
+        "⏳ Offline Piper TTS start ho raha hai…\n"
+        f"Speed: {rate:.1f}x"
     )
 
-    await process_job(
-        update=query,
-        context=context,
-        job=job,
-        voice=voice,
-        rate=rate,
+    context.application.create_task(
+        process(
+            status,
+            context,
+            job,
+            query.message.chat_id,
+            rate,
+        )
     )
 
 
-async def process_job(update, context, job, voice, rate):
-    chat_id = update.message.chat_id if update.message else update.from_user.id
-    status = await context.bot.send_message(
-        chat_id=chat_id,
-        text="📖 TXT read kar raha hoon...",
-    )
+# --------------------------------------------------
+# AUDIOBOOK CONVERSION
+# --------------------------------------------------
 
-    work = Path(job["dir"])
-    input_path = Path(job["path"])
-    name = job["name"]
-    started_at = time.monotonic()
+async def process(status, context, job, chat_id, rate):
+    work = job["dir"]
+    started = time.monotonic()
 
     try:
-        text = input_path.read_text(
+        await asyncio.to_thread(get_voice)
+
+        text = job["path"].read_text(
             encoding="utf-8-sig",
             errors="replace",
         )
 
         chunks = split_text(text)
+
         if not chunks:
-            raise RuntimeError("TXT mein readable text nahi mila.")
+            raise RuntimeError("TXT mein readable text nahi mila")
 
         total = len(chunks)
-        files = [
-            work / f"chunk_{index:05d}.mp3"
-            for index in range(total)
+        mp3_files = [
+            work / f"chunk_{i:05d}.mp3"
+            for i in range(total)
         ]
 
         await status.edit_text(
-            f"📚 Total chunks: {total}\n"
-            f"🎙 Voice: {voice}\n"
+            "🎙 <b>Offline audiobook ban raha hai</b>\n"
+            f"{VOICE_LABEL}\n"
+            f"{progress_bar(0)} <b>0%</b> (0/{total})\n"
             f"⚡ Speed: {rate:.1f}x\n"
-            f"{progress_bar(0)} 0%",
+            "⏱ Elapsed: 0:00:00 | ETA: calculating...",
+            parse_mode="HTML",
         )
 
-        semaphore = asyncio.Semaphore(CONCURRENCY)
-        tasks = [
-            asyncio.create_task(
-                tts_chunk(chunk, voice, files[index], semaphore, rate)
+        durations = [0.0] * total
+
+        for i, chunk in enumerate(chunks):
+            wav_path = work / f"chunk_{i:05d}.wav"
+
+            await tts_chunk(
+                chunk,
+                wav_path,
+                mp3_files[i],
+                rate,
             )
-            for index, chunk in enumerate(chunks)
-        ]
 
-        done = 0
-        last_update = time.monotonic()
+            durations[i] = await audio_duration(mp3_files[i])
 
-        while True:
-            completed = sum(task.done() for task in tasks)
-            if completed == total:
-                break
+            done = i + 1
+            elapsed = time.monotonic() - started
+            percent = int(done * 100 / total)
+            completed_audio = sum(durations[:done])
+            estimated_total = (
+                completed_audio / done * total if done else 0
+            )
+            eta = elapsed / done * (total - done) if done else 0
 
-            failed = [
-                task for task in tasks
-                if task.done() and not task.cancelled()
-                and task.exception() is not None
-            ]
-
-            if failed:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                failed[0].result()
-
-            now = time.monotonic()
-            if now - last_update >= 5:
-                done = sum(
-                    task.done()
-                    and not task.cancelled()
-                    and task.exception() is None
-                    for task in tasks
-                )
-
-                percent = int(done * 100 / total)
-                elapsed = now - started_at
-                eta = elapsed / done * (total - done) if done else 0
-
-                completed_duration = 0.0
-                for file in files:
-                    if file.exists() and file.stat().st_size > 256:
-                        try:
-                            completed_duration += await audio_duration(file)
-                        except Exception:
-                            pass
-
-                estimated_duration = (
-                    completed_duration / done * total
-                    if done and completed_duration
-                    else 0
-                )
-
-                message = (
-                    "🎙 <b>Audiobook ban raha hai</b>\n"
+            try:
+                await status.edit_text(
+                    "🎙 <b>Offline audiobook ban raha hai</b>\n"
                     f"{progress_bar(percent)} <b>{percent}%</b> "
                     f"({done}/{total} chunks)\n"
-                    f"🎧 Completed audio: {fmt_clock(completed_duration)}\n"
+                    f"🎧 Completed audio: {fmt_clock(completed_audio)}\n"
+                    f"🎵 Estimated total: {fmt_clock(estimated_total)}\n"
+                    f"⚡ Speed: {rate:.1f}x\n"
+                    f"⏱ Elapsed: {fmt_clock(elapsed)} | "
+                    f"ETA: {fmt_clock(eta)}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                log.warning(
+                    "Progress update failed",
+                    exc_info=True,
                 )
 
-                if estimated_duration:
-                    message += (
-                        "🎵 Estimated total: "
-                        f"{fmt_clock(estimated_duration)}\n"
-                    )
-
-                message += (
-                    f"⏱ Elapsed: {fmt_clock(elapsed)}\n"
-                    f"⏳ ETA: {fmt_clock(eta)}"
-                )
-
-                try:
-                    await status.edit_text(
-                        message,
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    log.debug("Progress message update failed", exc_info=True)
-
-                last_update = now
-
-            await asyncio.sleep(1)
-
-        for task in tasks:
-            task.result()
-
-        elapsed_tts = time.monotonic() - started_at
-        durations = [await audio_duration(file) for file in files]
         total_duration = sum(durations)
 
-        await status.edit_text(
-            "✅ TTS generation complete!\n"
-            f"{progress_bar(100)} 100%\n"
-            f"🎧 Audio duration: {fmt_clock(total_duration)}\n"
-            f"⏱ Processing time: {fmt_clock(elapsed_tts)}"
-        )
-
         parts = []
-        current_files = []
+        current = []
         current_duration = 0.0
 
-        for file, duration in zip(files, durations):
-            if (
-                current_files
-                and current_duration + duration > MAX_PART_SECONDS
-            ):
-                parts.append((current_files, current_duration))
-                current_files = []
+        for file, duration in zip(mp3_files, durations):
+            if current and current_duration + duration > MAX_PART_SECONDS:
+                parts.append((current, current_duration))
+                current = []
                 current_duration = 0.0
 
-            current_files.append(file)
+            current.append(file)
             current_duration += duration
 
-        if current_files:
-            parts.append((current_files, current_duration))
+        if current:
+            parts.append((current, current_duration))
 
-        total_parts = len(parts)
-
-        for index, (group, duration) in enumerate(parts, start=1):
-            elapsed = time.monotonic() - started_at
+        for index, (group, duration) in enumerate(parts, 1):
             await status.edit_text(
-                "📤 Audiobook parts send ho rahe hain\n"
-                f"{progress_bar((index - 1) * 100 // total_parts)} "
-                f"{index - 1}/{total_parts} parts sent\n"
+                "📤 <b>MP3 parts bhej raha hoon</b>\n"
+                f"{progress_bar((index - 1) * 100 // len(parts))} "
+                f"{index - 1}/{len(parts)} parts\n"
                 f"🎧 Total duration: {fmt_clock(total_duration)}\n"
-                f"📀 Current part: {fmt_clock(duration)}\n"
-                f"⏱ Elapsed: {fmt_clock(elapsed)}"
+                f"📀 Current part: {fmt_clock(duration)}",
+                parse_mode="HTML",
             )
 
-            output = work / f"{name} - Part {index}.mp3"
+            output = work / f"{job['name']} - Part {index}.mp3"
             await concat_mp3(group, output)
 
             if output.stat().st_size > MAX_PART_BYTES:
                 raise RuntimeError(
-                    f"Part {index} Telegram file-size limit se badi hai."
+                    f"Part {index} Telegram size limit se bada hai"
                 )
 
-            caption = (
-                f"{name}\n"
-                f"Audiobook - Part {index}/{total_parts}\n"
-                f"{fmt_time(duration)} | Speed {rate:.1f}x"
-            )
-
-            with output.open("rb") as audio_file:
+            with output.open("rb") as audio:
                 await context.bot.send_audio(
                     chat_id=chat_id,
-                    audio=audio_file,
-                    title=f"{name} - Part {index}",
+                    audio=audio,
+                    title=f"{job['name']} - Part {index}",
                     performer=PERFORMER,
                     duration=int(duration),
-                    caption=caption,
+                    caption=(
+                        f"{job['name']}\n"
+                        f"Part {index}/{len(parts)} • "
+                        f"{fmt_time(duration)} • {rate:.1f}x"
+                    ),
                     filename=output.name,
                     read_timeout=900,
                     write_timeout=900,
@@ -657,52 +597,57 @@ async def process_job(update, context, job, voice, rate):
             "✅ <b>Audiobook complete!</b>\n"
             f"{progress_bar(100)} <b>100%</b>\n"
             f"🎧 Total duration: {fmt_clock(total_duration)}\n"
-            f"📀 Total parts: {total_parts}\n"
-            f"⏱ Total processing time: "
-            f"{fmt_clock(time.monotonic() - started_at)}",
+            f"📀 Parts: {len(parts)}\n"
+            f"⏱ Processing time: "
+            f"{fmt_clock(time.monotonic() - started)}",
             parse_mode="HTML",
         )
 
-    except Exception as error:
+    except Exception as exc:
         log.exception("Audiobook job failed")
+
         try:
             await status.edit_text(
-                f"❌ Error: {str(error)[:3000]}"
+                f"❌ Error: {str(exc)[:2500]}"
             )
         except Exception:
             pass
 
     finally:
         shutil.rmtree(work, ignore_errors=True)
-        context.user_data.pop("job", None)
-        context.user_data.pop("selected_voice", None)
 
 
 def main():
-    if not BOT_TOKEN:
+    if not BOT_TOKEN or BOT_TOKEN == "PASTE_TOKEN_HERE":
         raise RuntimeError(
-            "BOT_TOKEN environment variable set nahi hai."
+            "BOT_TOKEN GitHub Actions secret/environment mein set nahi hai"
         )
-
-    builder = Application.builder().token(BOT_TOKEN)
 
     if LOCAL_API:
         builder = (
-            builder
+            Application.builder()
+            .token(BOT_TOKEN)
             .base_url(f"{LOCAL_API}/bot")
             .base_file_url(f"{LOCAL_API}/file/bot")
             .local_mode(True)
         )
+    else:
+        builder = Application.builder().token(BOT_TOKEN)
 
     app = builder.build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("demo", demo_command))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-    app.add_handler(CallbackQueryHandler(on_voice, pattern=r"^v:"))
-    app.add_handler(CallbackQueryHandler(on_rate, pattern=r"^r:"))
+    app.add_handler(
+        CallbackQueryHandler(demo_voice, pattern=r"^demo$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(on_rate, pattern=r"^r:")
+    )
 
-    log.info("Audiobook bot started.")
-    app.run_polling()
+    log.info("Bot starting; offline Piper Hindi female voice selected")
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
