@@ -1,5 +1,4 @@
+python-telegram-bot==21.6
+piper-tts==1.2.0
 
-python-telegram-bot
-edge-tts==7.2.8
-gTTS
 
