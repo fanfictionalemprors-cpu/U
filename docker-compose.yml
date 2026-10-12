@@ -1,0 +1,26 @@
+services:
+  tgapi:
+    image: aiogram/telegram-bot-api:latest
+    restart: always
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      - tgdata:/var/lib/telegram-bot-api
+
+  bot:
+    build: .
+    restart: always
+    depends_on:
+      - tgapi
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      LOCAL_API_URL: http://tgapi:8081
+      PART_MINUTES: ${PART_MINUTES:-180}
+    volumes:
+      # same path chahiye taaki bot server ki downloaded files padh sake
+      - tgdata:/var/lib/telegram-bot-api
+
+volumes:
+  tgdata:
