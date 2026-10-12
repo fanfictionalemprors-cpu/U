@@ -1,0 +1,86 @@
+
+name: TTS Audiobook Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: tts-audiobook-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check required secrets
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          test -n "$BOT_TOKEN" || {
+            echo "BOT_TOKEN secret missing"
+            exit 1
+          }
+          test -n "$TELEGRAM_API_ID" || {
+            echo "TELEGRAM_API_ID secret missing"
+            exit 1
+          }
+          test -n "$TELEGRAM_API_HASH" || {
+            echo "TELEGRAM_API_HASH secret missing"
+            exit 1
+          }
+
+      - name: Configure environment
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          {
+            printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN"
+            printf 'TELEGRAM_API_ID=%s\n' "$TELEGRAM_API_ID"
+            printf 'TELEGRAM_API_HASH=%s\n' "$TELEGRAM_API_HASH"
+            printf 'PART_MINUTES=180\n'
+          } > .env
+
+      - name: Build and start services
+        run: docker compose up -d --build
+
+      - name: Check startup
+        run: |
+          sleep 15
+          docker compose ps
+          docker compose logs --tail=50 tgapi bot
+
+      - name: Keep bot running
+        run: |
+          for i in $(seq 1 320); do
+            if ! docker compose ps --status running --services | grep -qx tgapi; then
+              docker compose up -d tgapi
+            fi
+
+            if ! docker compose ps --status running --services | grep -qx bot; then
+              docker compose up -d bot
+            fi
+
+            sleep 60
+          done
+
+      - name: Print final logs
+        if: always()
+        run: docker compose logs --tail=100 || true
+
+      - name: Stop containers
+        if: always()
+        run: docker compose down
