@@ -1,95 +1,57 @@
-
-name: TTS Audiobook Bot
+name: Run Bot
 
 on:
   workflow_dispatch:
-
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *"   # backup: agar chain toot jaye to dobara start
 
+# Ek hi time par ek hi bot chale (do pollers = 409 conflict)
 concurrency:
-  group: tts-audiobook-bot
+  group: tts-bot
   cancel-in-progress: false
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
-  run-bot:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
-
+    timeout-minutes: 355     # GitHub job limit 6 ghante
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Check required secrets
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-        run: |
-          set -eu
-          test -n "$BOT_TOKEN" || {
-            echo "BOT_TOKEN secret missing"
-            exit 1
-          }
-          test -n "$TELEGRAM_API_ID" || {
-            echo "TELEGRAM_API_ID secret missing"
-            exit 1
-          }
-          test -n "$TELEGRAM_API_HASH" || {
-            echo "TELEGRAM_API_HASH secret missing"
-            exit 1
-          }
-
-      - name: Configure environment
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      - name: Write .env from secrets
         run: |
           {
-            printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN"
-            printf 'TELEGRAM_API_ID=%s\n' "$TELEGRAM_API_ID"
-            printf 'TELEGRAM_API_HASH=%s\n' "$TELEGRAM_API_HASH"
-            printf 'PART_MINUTES=180\n'
-            printf 'TTS_TIMEOUT_SECONDS=75\n'
-            printf 'TTS_RETRIES=7\n'
-            printf 'TTS_CONCURRENCY=2\n'
-            printf 'CHUNK_CHARS=1500\n'
+            echo "BOT_TOKEN=${{ secrets.BOT_TOKEN }}"
+            echo "TELEGRAM_API_ID=${{ secrets.TELEGRAM_API_ID }}"
+            echo "TELEGRAM_API_HASH=${{ secrets.TELEGRAM_API_HASH }}"
+            echo "PART_MINUTES=180"
+            echo "CHUNK_CHARS=1000"
+            echo "TTS_CONCURRENCY=1"
+            echo "TTS_RETRIES=3"
+            echo "TTS_TIMEOUT_SECONDS=75"
           } > .env
 
-      - name: Build bot with fresh dependencies
-        run: docker compose build --no-cache bot
+      - name: Start bot + local Telegram server
+        run: docker compose up -d --build
 
-      - name: Start Telegram API and bot
-        run: docker compose up -d --force-recreate
+      - name: Queue next run (relay)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml --repo "${{ github.repository }}"
 
-      - name: Check startup logs
+      - name: Keep alive (~5h 45m)
         run: |
-          sleep 15
-          docker compose ps
-          docker compose logs --tail=100 tgapi bot
-
-      - name: Keep services running
-        run: |
-          for i in $(seq 1 320); do
-            if ! docker compose ps --status running --services | grep -qx tgapi; then
-              docker compose up -d tgapi
-            fi
-
-            if ! docker compose ps --status running --services | grep -qx bot; then
-              docker compose up -d bot
-            fi
-
-            sleep 60
+          end=$((SECONDS + 20700))
+          while [ $SECONDS -lt $end ]; do
+            sleep 300
+            docker compose ps --status running | grep -q bot || docker compose up -d
           done
 
-      - name: Final logs
+      - name: Stop
         if: always()
-        run: docker compose logs --tail=150 || true
-
-      - name: Stop services
-        if: always()
-        run: docker compose down
+        run: |
+          docker compose logs --tail 50 bot || true
+          docker compose down
