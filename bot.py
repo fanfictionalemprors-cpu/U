@@ -1,8 +1,8 @@
 
 import asyncio
 import logging
-import random
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 
 import edge_tts
+from gtts import gTTS
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -20,16 +22,20 @@ from telegram.ext import (
     filters,
 )
 
+# ---------------- CONFIG ----------------
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 LOCAL_API = os.getenv("LOCAL_API_URL", "").rstrip("/")
 
 BITRATE_KBPS = 48
 SAFETY = 0.97
+
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "1500"))
 CONCURRENCY = int(os.getenv("TTS_CONCURRENCY", "2"))
 TTS_RETRIES = int(os.getenv("TTS_RETRIES", "7"))
 TTS_TIMEOUT_SECONDS = int(os.getenv("TTS_TIMEOUT_SECONDS", "75"))
 PROGRESS_INTERVAL = 12
+
 PERFORMER = "AudioBook Pro"
 
 if LOCAL_API:
@@ -39,7 +45,9 @@ else:
     MAX_PART_BYTES = 50 * 1000 * 1000
     MAX_DOWNLOAD_BYTES = 20 * 1000 * 1000
 
-MAX_PART_SECONDS = MAX_PART_BYTES * SAFETY / (BITRATE_KBPS * 1000 / 8)
+MAX_PART_SECONDS = (
+    MAX_PART_BYTES * SAFETY / (BITRATE_KBPS * 1000 / 8)
+)
 
 if LOCAL_API:
     MAX_PART_SECONDS = min(
@@ -61,27 +69,28 @@ logging.basicConfig(
 log = logging.getLogger("ttsbot")
 
 
-def fmt_time(sec):
-    sec = max(0, int(sec))
-    return f"{sec // 3600}h {(sec % 3600) // 60}m {sec % 60}s"
+# ---------------- HELPERS ----------------
+
+def fmt_clock(seconds):
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours}:{minutes:02d}:{secs:02d}"
 
 
-def fmt_clock(sec):
-    sec = max(0, int(sec))
-    return f"{sec // 3600}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
-
-
-def progress_bar(pct, width=12):
-    pct = max(0, min(100, int(pct)))
-    filled = round(width * pct / 100)
+def progress_bar(percent, width=12):
+    percent = max(0, min(100, int(percent)))
+    filled = round(width * percent / 100)
     return "█" * filled + "░" * (width - filled)
 
 
 def split_text(text, limit=CHUNK_CHARS):
     text = re.sub(r"[ \t]+", " ", text)
     sentences = re.split(r"(?<=[।.!?\n])\s*", text)
+
     chunks = []
-    cur = ""
+    current = ""
 
     for sentence in sentences:
         sentence = sentence.strip()
@@ -90,160 +99,247 @@ def split_text(text, limit=CHUNK_CHARS):
 
         while len(sentence) > limit:
             cut = sentence.rfind(" ", 0, limit)
-            cut = cut if cut > 0 else limit
+            if cut <= 0:
+                cut = limit
 
-            if cur:
-                chunks.append(cur)
-                cur = ""
+            if current:
+                chunks.append(current)
+                current = ""
 
-            chunks.append(sentence[:cut])
+            chunks.append(sentence[:cut].strip())
             sentence = sentence[cut:].strip()
 
-        if len(cur) + len(sentence) + 1 > limit:
-            if cur:
-                chunks.append(cur)
-            cur = sentence
+        if len(current) + len(sentence) + 1 > limit:
+            if current:
+                chunks.append(current)
+            current = sentence
         else:
-            cur = f"{cur} {sentence}".strip()
+            current = f"{current} {sentence}".strip()
 
-    if cur:
-        chunks.append(cur)
+    if current:
+        chunks.append(current)
 
     return [chunk for chunk in chunks if chunk.strip()]
 
 
-async def run(*cmd):
+async def run_command(*command):
     process = await asyncio.create_subprocess_exec(
-        *cmd,
+        *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    out, err = await process.communicate()
+
+    stdout, stderr = await process.communicate()
 
     if process.returncode != 0:
-        raise RuntimeError(err.decode(errors="ignore")[-1000:])
+        raise RuntimeError(
+            stderr.decode(errors="replace")[-1500:]
+        )
 
-    return out.decode().strip()
+    return stdout.decode().strip()
 
 
 async def audio_duration(path):
-    result = await run(
+    result = await run_command(
         "ffprobe",
         "-v", "error",
         "-show_entries", "format=duration",
-        "-of", "default=nw=1:nk=1",
+        "-of", "default=noprint_wrappers=1:nokey=1",
         str(path),
     )
     return float(result)
 
 
-async def tts_chunk(text, voice, output, semaphore):
-    async with semaphore:
-        last_error = None
+# ---------------- TTS ENGINE ----------------
 
-        for attempt in range(1, TTS_RETRIES + 1):
+def is_http_403(error):
+    return (
+        getattr(error, "status", None) == 403
+        or getattr(error, "status_code", None) == 403
+        or "status=403" in repr(error)
+        or "403 Forbidden" in str(error)
+    )
+
+
+async def edge_tts_chunk(text, voice, output):
+    last_error = None
+
+    for attempt in range(1, TTS_RETRIES + 1):
+        output.unlink(missing_ok=True)
+
+        try:
+            communicate = edge_tts.Communicate(
+                text=text,
+                voice=voice,
+            )
+
+            await asyncio.wait_for(
+                communicate.save(str(output)),
+                timeout=TTS_TIMEOUT_SECONDS,
+            )
+
+            if output.exists() and output.stat().st_size > 256:
+                return
+
+            raise RuntimeError("Edge TTS generated an empty file")
+
+        except asyncio.CancelledError:
+            output.unlink(missing_ok=True)
+            raise
+
+        except Exception as error:
+            last_error = error
             output.unlink(missing_ok=True)
 
-            try:
-                communicate = edge_tts.Communicate(text, voice)
+            log.warning(
+                "Edge TTS attempt %s/%s failed: %r",
+                attempt,
+                TTS_RETRIES,
+                error,
+            )
 
-                await asyncio.wait_for(
-                    communicate.save(str(output)),
-                    timeout=TTS_TIMEOUT_SECONDS,
-                )
+            # Repeating the same request is unlikely to fix HTTP 403.
+            if is_http_403(error):
+                break
 
-                if output.exists() and output.stat().st_size > 256:
-                    return
+            if attempt < TTS_RETRIES:
+                delay = min(30, 2 ** attempt)
+                await asyncio.sleep(delay + random.uniform(0, 1))
 
-                raise RuntimeError("Empty or incomplete TTS audio")
+    raise RuntimeError(
+        f"Edge TTS failed: {last_error!r}"
+    )
 
-            except asyncio.CancelledError:
-                output.unlink(missing_ok=True)
-                raise
 
-            except Exception as error:
-                last_error = error
-                output.unlink(missing_ok=True)
+async def google_tts_chunk(text, voice, output):
+    # gTTS supports language selection, not Neural male/female voice selection.
+    language = "hi" if voice.startswith("hi-IN") else "en"
 
-                log.warning(
-                    "TTS attempt %s/%s failed; voice=%s; chars=%s; error=%r",
-                    attempt,
-                    TTS_RETRIES,
-                    voice,
-                    len(text),
-                    error,
-                )
+    output.unlink(missing_ok=True)
 
-                if attempt < TTS_RETRIES:
-                    delay = min(45, 3 * (2 ** (attempt - 1)))
-                    delay += random.uniform(0, 1.5)
-                    await asyncio.sleep(delay)
+    def generate():
+        tts = gTTS(
+            text=text,
+            lang=language,
+            slow=False,
+        )
+        tts.save(str(output))
 
-        raise RuntimeError(
-            f"TTS failed after {TTS_RETRIES} attempts: {last_error!r}"
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(generate),
+            timeout=120,
         )
 
+        if output.exists() and output.stat().st_size > 256:
+            log.info("gTTS fallback succeeded: %s", output.name)
+            return
+
+        raise RuntimeError("gTTS generated an empty file")
+
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
+
+
+async def tts_chunk(text, voice, output, semaphore):
+    async with semaphore:
+        try:
+            await edge_tts_chunk(text, voice, output)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as edge_error:
+            log.warning(
+                "Edge TTS unavailable; trying gTTS fallback: %r",
+                edge_error,
+            )
+
+            try:
+                await google_tts_chunk(text, voice, output)
+            except asyncio.CancelledError:
+                raise
+            except Exception as fallback_error:
+                output.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Edge TTS failed: {edge_error!r}; "
+                    f"gTTS fallback failed: {fallback_error!r}"
+                ) from fallback_error
+
+
+# ---------------- MP3 PROCESSING ----------------
 
 async def concat_mp3(files, output):
     list_file = output.with_suffix(".concat.txt")
 
     try:
+        lines = []
+
+        for file in files:
+            # Escape single quotes for ffmpeg concat list syntax.
+            safe_path = str(file.resolve()).replace("'", "'\\''")
+            lines.append(f"file '{safe_path}'\n")
+
         list_file.write_text(
-            "".join(
-                f"file '{file.as_posix()}'\n"
-                for file in files
-            ),
+            "".join(lines),
             encoding="utf-8",
         )
 
-        await run(
+        await run_command(
             "ffmpeg",
             "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", str(list_file),
+            "-vn",
             "-c:a", "libmp3lame",
             "-b:a", f"{BITRATE_KBPS}k",
             "-ac", "1",
-            "-ar", "24000",
             str(output),
         )
+
     finally:
         list_file.unlink(missing_ok=True)
 
 
-async def start(update, ctx):
+# ---------------- TELEGRAM HANDLERS ----------------
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Namaste! Mujhe ek .txt file bhejo.\n\n"
-        "1️⃣ TXT file bhejo\n"
-        "2️⃣ Voice choose karo\n"
-        "3️⃣ Audiobook MP3 parts milenge 🎧"
+        "👋 Welcome to AudioBook Pro!\n\n"
+        "📄 Send me a .txt file.\n"
+        "🎙 Select a voice.\n"
+        "🎧 I will convert it into MP3 audiobook parts.\n\n"
+        "Progress, audio duration and ETA will be shown."
     )
 
 
-async def on_document(update, ctx):
+async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
 
     if not document.file_name.lower().endswith(".txt"):
-        await update.message.reply_text("❌ Sirf .txt file bhejo.")
+        await update.message.reply_text(
+            "❌ Please send a .txt file."
+        )
         return
 
     if document.file_size and document.file_size > MAX_DOWNLOAD_BYTES:
         await update.message.reply_text(
-            f"❌ File limit {MAX_DOWNLOAD_BYTES // 1_000_000} MB hai."
+            f"❌ File limit: {MAX_DOWNLOAD_BYTES // 1_000_000} MB."
         )
         return
 
-    work = Path(tempfile.mkdtemp(prefix="tts_"))
+    work = Path(tempfile.mkdtemp(prefix="audiobook_"))
 
     try:
-        path = work / "input.txt"
+        input_path = work / "input.txt"
         telegram_file = await ctx.bot.get_file(document.file_id)
-        await telegram_file.download_to_drive(path)
+        await telegram_file.download_to_drive(input_path)
 
         ctx.user_data["job"] = {
-            "dir": work,
-            "path": path,
+            "dir": str(work),
+            "path": str(input_path),
             "name": Path(document.file_name).stem,
         }
 
@@ -251,56 +347,75 @@ async def on_document(update, ctx):
             [
                 InlineKeyboardButton(
                     label,
-                    callback_data=f"v:{key}",
+                    callback_data=f"voice:{key}",
                 )
             ]
             for key, (label, _) in VOICES.items()
         ]
 
         await update.message.reply_text(
-            f"📘 {document.file_name} mil gayi.\nVoice choose karo:",
+            f"📘 File received: {document.file_name}\n\n"
+            "Choose your audiobook voice:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
     except Exception:
         shutil.rmtree(work, ignore_errors=True)
-        raise
+        log.exception("File download failed")
+        await update.message.reply_text(
+            "❌ File download failed. Please try again."
+        )
 
 
-async def on_voice(update, ctx):
+async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     job = ctx.user_data.get("job")
 
     if not job:
-        await query.edit_message_text("File expire ho gayi. Dobara bhejo.")
+        await query.edit_message_text(
+            "❌ File session expired. Please send the TXT again."
+        )
         return
-
-    ctx.user_data["job"] = None
 
     voice_key = query.data.split(":", 1)[1]
 
     if voice_key not in VOICES:
-        await query.edit_message_text("Invalid voice. TXT dobara bhejo.")
+        await query.edit_message_text("❌ Invalid voice selection.")
         return
 
+    ctx.user_data["job"] = None
+
     voice = VOICES[voice_key][1]
-    status = await query.edit_message_text("⏳ Audiobook shuru ho raha hai...")
+
+    status = await query.edit_message_text(
+        "⏳ Preparing audiobook..."
+    )
 
     ctx.application.create_task(
-        process(status, ctx, job, voice, query.message.chat_id)
+        process(
+            status=status,
+            ctx=ctx,
+            job=job,
+            voice=voice,
+            chat_id=query.message.chat_id,
+        )
     )
 
 
+# ---------------- AUDIOBOOK WORKER ----------------
+
 async def process(status, ctx, job, voice, chat_id):
-    work = job["dir"]
+    work = Path(job["dir"])
     name = job["name"]
+    input_path = Path(job["path"])
+
     tasks = []
     started_at = time.monotonic()
 
     try:
-        raw = job["path"].read_bytes()
+        raw = input_path.read_bytes()
 
         try:
             text = raw.decode("utf-8-sig")
@@ -311,21 +426,27 @@ async def process(status, ctx, job, voice, chat_id):
         total = len(chunks)
 
         if not total:
-            await status.edit_text("❌ TXT file khaali hai.")
+            await status.edit_text("❌ The TXT file is empty.")
             return
 
         semaphore = asyncio.Semaphore(CONCURRENCY)
-        files = [work / f"chunk_{i:05d}.mp3" for i in range(total)]
+        chunk_files = [
+            work / f"chunk_{i:05d}.mp3"
+            for i in range(total)
+        ]
+
         done = 0
 
         async def worker(index):
             nonlocal done
+
             await tts_chunk(
                 chunks[index],
                 voice,
-                files[index],
+                chunk_files[index],
                 semaphore,
             )
+
             done += 1
 
         tasks = [
@@ -334,19 +455,19 @@ async def process(status, ctx, job, voice, chat_id):
         ]
 
         await status.edit_text(
-            f"🎙 Audiobook ban raha hai\n"
+            "🎙 Audiobook generation started\n"
             f"{progress_bar(0)} 0% (0/{total} chunks)\n"
-            f"🎧 MP3 duration: calculating...\n"
-            f"⏱ Elapsed: 0:00:00 | ETA: calculating..."
+            "🎧 MP3 duration: calculating...\n"
+            "⏱ Elapsed: 0:00:00 | ETA: calculating..."
         )
 
-        last_pct = -1
+        last_percent = -1
         last_update = time.monotonic()
 
         while not all(task.done() for task in tasks):
             await asyncio.sleep(3)
 
-            failed = next(
+            failed_task = next(
                 (
                     task for task in tasks
                     if task.done()
@@ -356,140 +477,159 @@ async def process(status, ctx, job, voice, chat_id):
                 None,
             )
 
-            if failed is not None:
+            if failed_task is not None:
                 for task in tasks:
                     if not task.done():
                         task.cancel()
 
-                await asyncio.gather(*tasks, return_exceptions=True)
-                failed.result()
+                await asyncio.gather(
+                    *tasks,
+                    return_exceptions=True,
+                )
 
-            pct = done * 100 // total
+                failed_task.result()
+
+            percent = done * 100 // total
             elapsed = time.monotonic() - started_at
 
-            should_update = (
-                pct != last_pct
-                or time.monotonic() - last_update >= PROGRESS_INTERVAL
-            )
-
-            if not should_update:
+            if (
+                percent == last_percent
+                and time.monotonic() - last_update < PROGRESS_INTERVAL
+            ):
                 continue
 
-            last_pct = pct
+            last_percent = percent
             last_update = time.monotonic()
 
-            eta = elapsed / done * (total - done) if done else None
+            eta = (
+                elapsed / done * (total - done)
+                if done else None
+            )
 
-            completed_audio = 0.0
+            completed_duration = 0.0
 
-            for file in files:
+            for file in chunk_files:
                 if file.exists() and file.stat().st_size > 256:
                     try:
-                        completed_audio += await audio_duration(file)
+                        completed_duration += await audio_duration(file)
                     except Exception:
-                        pass
+                        log.warning(
+                            "Unable to read duration for %s",
+                            file.name,
+                        )
 
-            estimated_audio = (
-                completed_audio / done * total
-                if done and completed_audio else 0
+            estimated_duration = (
+                completed_duration / done * total
+                if done and completed_duration else 0
             )
 
             message = (
-                f"🎙 Audiobook ban raha hai\n"
-                f"{progress_bar(pct)} {pct}% ({done}/{total} chunks)\n"
-                f"🎧 MP3 duration: {fmt_clock(completed_audio)} complete\n"
+                "🎙 Audiobook generation\n"
+                f"{progress_bar(percent)} {percent}% "
+                f"({done}/{total} chunks)\n"
+                f"🎧 Completed MP3 duration: "
+                f"{fmt_clock(completed_duration)}\n"
             )
 
-            if estimated_audio:
+            if estimated_duration:
                 message += (
                     f"📀 Estimated total duration: "
-                    f"~{fmt_clock(estimated_audio)}\n"
+                    f"~{fmt_clock(estimated_duration)}\n"
                 )
 
             message += (
                 f"⏱ Elapsed: {fmt_clock(elapsed)} | "
-                f"ETA: {fmt_clock(eta) if eta is not None else 'calculating...'}"
+                f"ETA: "
+                f"{fmt_clock(eta) if eta is not None else 'calculating...'}"
             )
 
             if done == 0:
                 message += (
-                    f"\n🔄 First chunk running; "
-                    f"timeout is {TTS_TIMEOUT_SECONDS}s."
+                    "\n🔄 Waiting for first chunk; "
+                    f"timeout per Edge request: {TTS_TIMEOUT_SECONDS}s."
                 )
 
             try:
                 await status.edit_text(message)
             except Exception:
-                log.warning("Progress update failed", exc_info=True)
+                log.warning(
+                    "Progress message update failed",
+                    exc_info=True,
+                )
 
         for task in tasks:
             task.result()
 
-        elapsed_tts = time.monotonic() - started_at
-        durations = [await audio_duration(file) for file in files]
+        tts_elapsed = time.monotonic() - started_at
+
+        durations = [
+            await audio_duration(file)
+            for file in chunk_files
+        ]
+
         total_duration = sum(durations)
 
         await status.edit_text(
-            f"✅ TTS generation complete!\n"
-            f"{progress_bar(100)} 100% ({total}/{total} chunks)\n"
-            f"🎧 MP3 duration: {fmt_clock(total_duration)}\n"
-            f"⏱ TTS processing time: {fmt_clock(elapsed_tts)}"
+            f"✅ Audio generation complete\n"
+            f"{progress_bar(100)} 100% ({total}/{total})\n"
+            f"🎧 Total MP3 duration: {fmt_clock(total_duration)}\n"
+            f"⏱ TTS processing time: {fmt_clock(tts_elapsed)}\n"
+            "📤 Preparing MP3 parts..."
         )
 
-        parts = []
-        current_files = []
+        groups = []
+        current_group = []
         current_duration = 0.0
 
-        for file, duration in zip(files, durations):
-            if current_files and current_duration + duration > MAX_PART_SECONDS:
-                parts.append((current_files, current_duration))
-                current_files = []
+        for file, duration in zip(chunk_files, durations):
+            if (
+                current_group
+                and current_duration + duration > MAX_PART_SECONDS
+            ):
+                groups.append((current_group, current_duration))
+                current_group = []
                 current_duration = 0.0
 
-            current_files.append(file)
+            current_group.append(file)
             current_duration += duration
 
-        if current_files:
-            parts.append((current_files, current_duration))
+        if current_group:
+            groups.append((current_group, current_duration))
 
-        total_parts = len(parts)
+        total_parts = len(groups)
 
-        for index, (group, duration) in enumerate(parts, 1):
-            elapsed = time.monotonic() - started_at
-            eta = (
-                elapsed / (index - 1) * (total_parts - index + 1)
-                if index > 1 else None
-            )
+        for part_number, (group, part_duration) in enumerate(groups, 1):
+            output = work / f"{name} - Part {part_number}.mp3"
 
-            await status.edit_text(
-                f"📤 Audiobook parts send ho rahe hain\n"
-                f"{progress_bar((index - 1) * 100 // total_parts)} "
-                f"{(index - 1) * 100 // total_parts}% "
-                f"(Part {index - 1}/{total_parts})\n"
-                f"🎧 Total MP3 duration: {fmt_clock(total_duration)}\n"
-                f"📀 Current part: {fmt_clock(duration)}\n"
-                f"⏱ Elapsed: {fmt_clock(elapsed)} | "
-                f"ETA: {fmt_clock(eta) if eta is not None else 'calculating...'}"
-            )
-
-            output = work / f"{name} - Part {index}.mp3"
             await concat_mp3(group, output)
 
             if output.stat().st_size > MAX_PART_BYTES:
                 raise RuntimeError(
-                    f"Part {index} exceeds the upload size limit."
+                    f"Part {part_number} exceeds the configured upload limit."
                 )
 
-            with open(output, "rb") as audio_file:
+            elapsed = time.monotonic() - started_at
+
+            await status.edit_text(
+                "📤 Sending audiobook parts\n"
+                f"{progress_bar((part_number - 1) * 100 // total_parts)} "
+                f"{(part_number - 1) * 100 // total_parts}%\n"
+                f"📀 Part: {part_number}/{total_parts}\n"
+                f"🎧 Total duration: {fmt_clock(total_duration)}\n"
+                f"⏱ Elapsed: {fmt_clock(elapsed)}"
+            )
+
+            with output.open("rb") as audio_file:
                 await ctx.bot.send_audio(
-                    chat_id,
+                    chat_id=chat_id,
                     audio=audio_file,
-                    title=f"{name} - Part {index}",
+                    title=f"{name} - Part {part_number}",
                     performer=PERFORMER,
-                    duration=int(duration),
+                    duration=int(part_duration),
                     caption=(
-                        f"{name}\nAudiobook - Part {index}\n"
-                        f"{fmt_time(duration)} | {voice}"
+                        f"📚 {name}\n"
+                        f"🎧 Part {part_number}/{total_parts}\n"
+                        f"⏱ Duration: {fmt_clock(part_duration)}"
                     ),
                     filename=output.name,
                     read_timeout=900,
@@ -500,10 +640,10 @@ async def process(status, ctx, job, voice, chat_id):
             output.unlink(missing_ok=True)
 
         await status.edit_text(
-            f"✅ Audiobook complete!\n"
+            "✅ Audiobook completed!\n"
             f"{progress_bar(100)} 100%\n"
             f"🎧 Total MP3 duration: {fmt_clock(total_duration)}\n"
-            f"📀 MP3 parts: {total_parts}\n"
+            f"📀 Total parts: {total_parts}\n"
             f"⏱ Total processing time: "
             f"{fmt_clock(time.monotonic() - started_at)}"
         )
@@ -512,26 +652,44 @@ async def process(status, ctx, job, voice, chat_id):
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+
+        await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
         raise
 
     except Exception as error:
-        log.exception("Audiobook job failed")
+        log.exception("Audiobook processing failed")
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
 
         try:
             await status.edit_text(
-                f"❌ TTS/Audiobook error:\n{str(error)[:3000]}"
+                "❌ TTS/Audiobook error:\n"
+                f"{str(error)[:2500]}"
             )
         except Exception:
-            log.exception("Could not send error status")
+            log.exception("Unable to report audiobook error")
 
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
+# ---------------- START BOT ----------------
+
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is missing.")
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing."
+        )
 
     builder = Application.builder().token(BOT_TOKEN)
 
@@ -543,11 +701,16 @@ def main():
         )
 
     app = builder.build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-    app.add_handler(CallbackQueryHandler(on_voice, pattern=r"^v:"))
 
-    log.info("TTS audiobook bot starting...")
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(
+        MessageHandler(filters.Document.ALL, on_document)
+    )
+    app.add_handler(
+        CallbackQueryHandler(on_voice, pattern=r"^voice:")
+    )
+
+    log.info("AudioBook Pro starting...")
     app.run_polling()
 
 
