@@ -3,6 +3,7 @@ name: TTS Audiobook Bot
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "0 */6 * * *"
 
@@ -28,6 +29,7 @@ jobs:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         run: |
+          set -eu
           test -n "$BOT_TOKEN" || {
             echo "BOT_TOKEN secret missing"
             exit 1
@@ -52,18 +54,25 @@ jobs:
             printf 'TELEGRAM_API_ID=%s\n' "$TELEGRAM_API_ID"
             printf 'TELEGRAM_API_HASH=%s\n' "$TELEGRAM_API_HASH"
             printf 'PART_MINUTES=180\n'
+            printf 'TTS_TIMEOUT_SECONDS=75\n'
+            printf 'TTS_RETRIES=7\n'
+            printf 'TTS_CONCURRENCY=2\n'
+            printf 'CHUNK_CHARS=1500\n'
           } > .env
 
-      - name: Build and start services
-        run: docker compose up -d --build
+      - name: Build bot with fresh dependencies
+        run: docker compose build --no-cache bot
 
-      - name: Check startup
+      - name: Start Telegram API and bot
+        run: docker compose up -d --force-recreate
+
+      - name: Check startup logs
         run: |
           sleep 15
           docker compose ps
-          docker compose logs --tail=50 tgapi bot
+          docker compose logs --tail=100 tgapi bot
 
-      - name: Keep bot running
+      - name: Keep services running
         run: |
           for i in $(seq 1 320); do
             if ! docker compose ps --status running --services | grep -qx tgapi; then
@@ -77,10 +86,10 @@ jobs:
             sleep 60
           done
 
-      - name: Print final logs
+      - name: Final logs
         if: always()
-        run: docker compose logs --tail=100 || true
+        run: docker compose logs --tail=150 || true
 
-      - name: Stop containers
+      - name: Stop services
         if: always()
         run: docker compose down
