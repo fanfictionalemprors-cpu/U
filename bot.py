@@ -6,7 +6,6 @@ import logging
 import shutil
 import subprocess
 import tempfile
-
 from pathlib import Path
 
 import edge_tts
@@ -31,9 +30,8 @@ from telegram.ext import (
     filters,
 )
 
-
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -77,14 +75,14 @@ def load_settings():
             SETTINGS_FILE.read_text(encoding="utf-8")
         )
     except (OSError, json.JSONDecodeError):
-        logger.exception("Settings could not be loaded")
+        logger.exception("Could not read settings")
         return {}
 
 
 def save_settings(data):
-    temporary = SETTINGS_FILE.with_suffix(".tmp")
+    temp_path = SETTINGS_FILE.with_suffix(".tmp")
 
-    temporary.write_text(
+    temp_path.write_text(
         json.dumps(
             data,
             ensure_ascii=False,
@@ -93,37 +91,37 @@ def save_settings(data):
         encoding="utf-8",
     )
 
-    temporary.replace(SETTINGS_FILE)
+    temp_path.replace(SETTINGS_FILE)
 
 
 def get_settings(user_id):
     all_settings = load_settings()
-    user_key = str(user_id)
+    key = str(user_id)
 
-    if user_key not in all_settings:
-        all_settings[user_key] = DEFAULT_SETTINGS.copy()
+    if key not in all_settings:
+        all_settings[key] = DEFAULT_SETTINGS.copy()
         save_settings(all_settings)
 
-    settings = DEFAULT_SETTINGS.copy()
-    settings.update(all_settings[user_key])
+    result = DEFAULT_SETTINGS.copy()
+    result.update(all_settings[key])
 
-    return settings
+    return result
 
 
-def update_setting(user_id, key, value):
+def update_setting(user_id, name, value):
     all_settings = load_settings()
-    user_key = str(user_id)
+    key = str(user_id)
 
-    if user_key not in all_settings:
-        all_settings[user_key] = DEFAULT_SETTINGS.copy()
+    if key not in all_settings:
+        all_settings[key] = DEFAULT_SETTINGS.copy()
 
-    all_settings[user_key][key] = value
+    all_settings[key][name] = value
 
     save_settings(all_settings)
 
 
 # =========================================================
-# MAIN MENU
+# MENUS
 # =========================================================
 
 def main_keyboard():
@@ -135,6 +133,7 @@ def main_keyboard():
             ["❌ Cancel Task", "ℹ️ Help"],
         ],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -144,31 +143,31 @@ def settings_keyboard():
             InlineKeyboardButton(
                 "Microsoft Edge TTS",
                 callback_data="engine_edge",
-            ),
+            )
         ],
         [
             InlineKeyboardButton(
                 "Google Translate TTS",
                 callback_data="engine_google",
-            ),
+            )
         ],
         [
             InlineKeyboardButton(
                 "🗣️ Select Voice",
                 callback_data="menu_voices",
-            ),
+            )
         ],
         [
             InlineKeyboardButton(
                 "⚡ Speech Rate",
                 callback_data="menu_speed",
-            ),
+            )
         ],
         [
             InlineKeyboardButton(
                 "🎚️ Pitch",
                 callback_data="menu_pitch",
-            ),
+            )
         ],
     ])
 
@@ -181,6 +180,7 @@ def clean_text(text):
     text = text.replace("\x00", " ")
     text = text.replace("\r\n", "\n")
     text = text.replace("\r", "\n")
+
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
@@ -188,10 +188,6 @@ def clean_text(text):
 
 
 def split_text(text, limit=MAX_CHUNK_SIZE):
-    """
-    Split text without intentionally dropping characters.
-    """
-
     chunks = []
 
     while len(text) > limit:
@@ -206,10 +202,10 @@ def split_text(text, limit=MAX_CHUNK_SIZE):
         if cut <= 0:
             cut = limit
 
-        chunk = text[:cut].strip()
+        piece = text[:cut].strip()
 
-        if chunk:
-            chunks.append(chunk)
+        if piece:
+            chunks.append(piece)
 
         text = text[cut:].strip()
 
@@ -243,23 +239,23 @@ def extract_txt(path):
 
 def extract_pdf(path):
     reader = PdfReader(str(path))
-    sections = []
 
-    for page in reader.pages:
-        sections.append(page.extract_text() or "")
-
-    return "\n\n".join(sections)
+    return "\n\n".join(
+        page.extract_text() or ""
+        for page in reader.pages
+    )
 
 
 def extract_docx(path):
-    document = Document(str(path))
-    sections = []
+    doc = Document(str(path))
 
-    for paragraph in document.paragraphs:
-        if paragraph.text.strip():
-            sections.append(paragraph.text)
+    parts = [
+        paragraph.text
+        for paragraph in doc.paragraphs
+        if paragraph.text.strip()
+    ]
 
-    for table in document.tables:
+    for table in doc.tables:
         for row in table.rows:
             cells = [
                 cell.text.strip()
@@ -268,14 +264,14 @@ def extract_docx(path):
             ]
 
             if cells:
-                sections.append(" | ".join(cells))
+                parts.append(" | ".join(cells))
 
-    return "\n\n".join(sections)
+    return "\n\n".join(parts)
 
 
 def extract_epub(path):
     book = epub.read_epub(str(path))
-    sections = []
+    parts = []
 
     for item in book.get_items_of_type(ITEM_DOCUMENT):
         soup = BeautifulSoup(
@@ -283,10 +279,8 @@ def extract_epub(path):
             "html.parser",
         )
 
-        for element in soup(
-            ["script", "style", "nav"]
-        ):
-            element.decompose()
+        for node in soup(["script", "style", "nav"]):
+            node.decompose()
 
         text = soup.get_text(
             separator="\n",
@@ -294,57 +288,59 @@ def extract_epub(path):
         )
 
         if text:
-            sections.append(text)
+            parts.append(text)
 
-    return "\n\n".join(sections)
+    return "\n\n".join(parts)
 
 
 def extract_document(path):
-    extension = path.suffix.lower()
+    ext = path.suffix.lower()
 
-    if extension == ".txt":
+    if ext == ".txt":
         return extract_txt(path)
 
-    if extension == ".pdf":
+    if ext == ".pdf":
         return extract_pdf(path)
 
-    if extension == ".docx":
+    if ext == ".docx":
         return extract_docx(path)
 
-    if extension == ".epub":
+    if ext == ".epub":
         return extract_epub(path)
 
     raise ValueError(
-        "Unsupported file. Send TXT, EPUB, PDF or DOCX."
+        "Unsupported file. Supported: TXT, EPUB, PDF, DOCX."
     )
 
 
 # =========================================================
-# RATE AND PITCH
+# RATE / PITCH
 # =========================================================
 
-def get_edge_rate(speed):
-    """
-    Converts 1.1x to +10%, 1.5x to +50%, 2.0x to +100%.
-    """
+VALID_RATES = [
+    round(x / 10, 1)
+    for x in range(11, 21)
+]
 
+VALID_PITCHES = [-6, -3, 0, 3, 6]
+
+
+def edge_rate(speed):
     speed = float(speed)
 
     if not 1.1 <= speed <= 2.0:
         raise ValueError(
-            "Speech rate must be between 1.1x and 2.0x."
+            "Rate must be between 1.1x and 2.0x."
         )
 
-    percent = round((speed - 1.0) * 100)
-
-    return f"+{percent}%"
+    return f"+{round((speed - 1.0) * 100)}%"
 
 
-def get_pitch_value(pitch):
+def edge_pitch(pitch):
     pitch = int(pitch)
 
-    if not -6 <= pitch <= 6:
-        raise ValueError("Pitch must be between -6 and +6.")
+    if pitch not in VALID_PITCHES:
+        raise ValueError("Invalid pitch.")
 
     return f"{pitch:+d}Hz"
 
@@ -356,7 +352,7 @@ def get_pitch_value(pitch):
 def require_ffmpeg():
     if not shutil.which("ffmpeg"):
         raise RuntimeError(
-            "FFmpeg is not installed on the server."
+            "FFmpeg is not installed on the runner."
         )
 
 
@@ -376,10 +372,10 @@ def run_ffmpeg(args):
         timeout=1800,
     )
 
-    if result.returncode != 0:
+    if result.returncode:
         raise RuntimeError(
             result.stderr[-1200:]
-            or "FFmpeg processing failed."
+            or "FFmpeg failed."
         )
 
 
@@ -389,29 +385,19 @@ def adjust_google_audio(
     speed,
     pitch,
 ):
-    """
-    Google Translate TTS does not expose a named voice,
-    arbitrary pitch, or a direct rate control.
-
-    This function applies speed and optional pitch
-    processing after generating the source audio.
-    """
-
     speed = max(1.1, min(float(speed), 2.0))
-    pitch = max(-6, min(int(pitch), 6))
+    pitch = int(pitch)
 
     filters = []
 
-    if pitch != 0:
+    if pitch:
         ratio = 2 ** (pitch / 12)
 
-        filters.append(
-            f"asetrate=44100*{ratio:.8f}"
-        )
-        filters.append("aresample=44100")
-        filters.append(
-            f"atempo={speed / ratio:.8f}"
-        )
+        filters.extend([
+            f"asetrate=44100*{ratio:.8f}",
+            "aresample=44100",
+            f"atempo={speed / ratio:.8f}",
+        ])
     else:
         filters.append(f"atempo={speed:.8f}")
 
@@ -425,84 +411,78 @@ def adjust_google_audio(
     ])
 
 
-def merge_audio(audio_files, output):
-    if not audio_files:
-        raise RuntimeError("No audio chunks were generated.")
+def merge_audio(files, output):
+    if not files:
+        raise RuntimeError(
+            "No audio chunks generated."
+        )
 
     require_ffmpeg()
 
-    concat_file = output.parent / "concat_list.txt"
+    list_file = output.parent / "concat_list.txt"
 
-    with concat_file.open(
+    with list_file.open(
         "w",
         encoding="utf-8",
     ) as file:
-        for audio in audio_files:
-            path = str(audio.resolve())
-            path = path.replace("'", "'\\''")
+        for item in files:
+            safe_path = str(item.resolve()).replace(
+                "'", "'\\''"
+            )
 
-            file.write(f"file '{path}'\n")
+            file.write(
+                f"file '{safe_path}'\n"
+            )
 
     try:
         run_ffmpeg([
             "-f", "concat",
             "-safe", "0",
-            "-i", str(concat_file),
+            "-i", str(list_file),
             "-vn",
             "-codec:a", "libmp3lame",
             "-b:a", "96k",
             str(output),
         ])
     finally:
-        concat_file.unlink(missing_ok=True)
+        list_file.unlink(missing_ok=True)
 
 
 # =========================================================
 # TTS ENGINES
 # =========================================================
 
-async def edge_tts_generate(
-    text,
-    output,
-    settings,
-):
+async def generate_edge(text, output, settings):
     communicate = edge_tts.Communicate(
         text=text,
         voice=settings["voice"],
-        rate=get_edge_rate(settings["speed"]),
-        pitch=get_pitch_value(settings["pitch"]),
+        rate=edge_rate(settings["speed"]),
+        pitch=edge_pitch(settings["pitch"]),
     )
 
     await communicate.save(str(output))
 
 
-def google_tts_generate(text, output):
-    tts = gTTS(
+def generate_google(text, output):
+    # Google Translate TTS does not provide a named Madhur voice.
+    gTTS(
         text=text,
         lang="hi",
         slow=False,
-    )
-
-    tts.save(str(output))
+    ).save(str(output))
 
 
-async def generate_audio_chunk(
-    text,
-    output,
-    settings,
-):
-    engine = settings["engine"]
-
-    if engine == "edge":
-        await edge_tts_generate(
+async def generate_chunk(text, output, settings):
+    if settings["engine"] == "edge":
+        await generate_edge(
             text,
             output,
             settings,
         )
 
-    elif engine == "google":
+    elif settings["engine"] == "google":
         await asyncio.to_thread(
-            google_tts_generate,
+            generate_google,
             text,
             output,
         )
@@ -523,15 +503,13 @@ async def generate_audio_chunk(
         adjusted.replace(output)
 
     else:
-        raise ValueError("Unsupported TTS engine.")
+        raise ValueError("Unknown TTS engine.")
 
     if not output.exists() or output.stat().st_size == 0:
-        raise RuntimeError("TTS engine generated an empty file.")
+        raise RuntimeError(
+            "TTS engine produced an empty audio file."
+        )
 
-
-# =========================================================
-# CONVERSION ENGINE
-# =========================================================
 
 async def convert_text(
     text,
@@ -542,21 +520,20 @@ async def convert_text(
     text = clean_text(text)
 
     if not text:
-        raise ValueError("No readable text was found.")
+        raise ValueError("No readable text found.")
 
     if len(text) > MAX_TEXT_LENGTH:
         raise ValueError(
-            "Text exceeds the configured 2,000,000 character limit."
+            "Text exceeds the 2,000,000 character limit."
         )
 
     chunks = split_text(text)
 
     with tempfile.TemporaryDirectory(
         prefix="tts_chunks_"
-    ) as directory:
-        temp = Path(directory)
-        audio_files = []
-
+    ) as tmp:
+        temp_dir = Path(tmp)
+        generated = []
         total = len(chunks)
 
         for index, chunk in enumerate(chunks, start=1):
@@ -567,15 +544,17 @@ async def convert_text(
                     "Generating speech",
                 )
 
-            audio_path = temp / f"chunk_{index:05d}.mp3"
+            audio_path = (
+                temp_dir / f"chunk_{index:05d}.mp3"
+            )
 
-            await generate_audio_chunk(
+            await generate_chunk(
                 chunk,
                 audio_path,
                 settings,
             )
 
-            audio_files.append(audio_path)
+            generated.append(audio_path)
 
         if progress_callback:
             await progress_callback(
@@ -586,7 +565,7 @@ async def convert_text(
 
         await asyncio.to_thread(
             merge_audio,
-            audio_files,
+            generated,
             output,
         )
 
@@ -600,37 +579,37 @@ async def convert_text(
 async def show_voices(
     update,
     context,
-    use_callback=False,
+    from_callback=False,
 ):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "🇮🇳 Madhur — Hindi Male",
                 callback_data="voice_madhur",
-            ),
+            )
         ],
         [
             InlineKeyboardButton(
                 "🇮🇳 Swara — Hindi Female",
                 callback_data="voice_swara",
-            ),
+            )
         ],
         [
             InlineKeyboardButton(
                 "🇬🇧 Sonia — English Female",
                 callback_data="voice_sonia",
-            ),
+            )
         ],
     ])
 
-    if use_callback:
+    if from_callback:
         await update.callback_query.edit_message_text(
-            "🗣️ Choose your voice:",
+            "🗣️ Choose a voice:",
             reply_markup=keyboard,
         )
     else:
         await update.effective_message.reply_text(
-            "🗣️ Choose your voice:",
+            "🗣️ Choose a voice:",
             reply_markup=keyboard,
         )
 
@@ -639,43 +618,39 @@ async def show_voices(
 # SPEECH RATE MENU
 # =========================================================
 
-async def show_speed(
+async def show_rates(
     update,
     context,
-    use_callback=False,
+    from_callback=False,
 ):
-    rates = [
-        1.1, 1.2, 1.3, 1.4, 1.5,
-        1.6, 1.7, 1.8, 1.9, 2.0,
-    ]
-
     keyboard = []
 
-    for index in range(0, len(rates), 2):
-        row = []
-
-        for rate in rates[index:index + 2]:
-            row.append(
-                InlineKeyboardButton(
-                    f"⚡ {rate:.1f}x",
-                    callback_data=f"speed_{rate:.1f}",
-                )
+    for index in range(0, len(VALID_RATES), 2):
+        row = [
+            InlineKeyboardButton(
+                f"⚡ {rate:.1f}x",
+                callback_data=f"speed_{rate:.1f}",
             )
+            for rate in VALID_RATES[index:index + 2]
+        ]
 
         keyboard.append(row)
 
     markup = InlineKeyboardMarkup(keyboard)
 
-    if use_callback:
+    text = (
+        "⚡ Choose speech rate (1.1x–2.0x):\n"
+        "Or send /rate 1.5"
+    )
+
+    if from_callback:
         await update.callback_query.edit_message_text(
-            "⚡ Select Speech Rate\n\n"
-            "Choose a speed from 1.1x to 2.0x:",
+            text,
             reply_markup=markup,
         )
     else:
         await update.effective_message.reply_text(
-            "⚡ Select Speech Rate\n\n"
-            "Choose a speed from 1.1x to 2.0x:",
+            text,
             reply_markup=markup,
         )
 
@@ -687,7 +662,7 @@ async def show_speed(
 async def show_pitch(
     update,
     context,
-    use_callback=False,
+    from_callback=False,
 ):
     keyboard = InlineKeyboardMarkup([
         [
@@ -716,20 +691,20 @@ async def show_pitch(
         ],
     ])
 
-    if use_callback:
+    if from_callback:
         await update.callback_query.edit_message_text(
-            "🎚️ Select Pitch:",
+            "🎚️ Choose pitch:",
             reply_markup=keyboard,
         )
     else:
         await update.effective_message.reply_text(
-            "🎚️ Select Pitch:",
+            "🎚️ Choose pitch:",
             reply_markup=keyboard,
         )
 
 
 # =========================================================
-# START AND HELP
+# COMMANDS
 # =========================================================
 
 async def start(update, context):
@@ -738,37 +713,105 @@ async def start(update, context):
 
     await update.effective_message.reply_text(
         "🎙️ Welcome to Speech Bot!\n\n"
-        "Convert text and books into audio.\n\n"
+        "Send text or upload TXT, EPUB, PDF, or DOCX.\n\n"
         f"Engine: {settings['engine']}\n"
         f"Voice: {settings['voice']}\n"
-        f"Speech Rate: {settings['speed']:.1f}x\n"
+        f"Rate: {settings['speed']:.1f}x\n"
         f"Pitch: {settings['pitch']}\n\n"
-        "Send text or upload a TXT, EPUB, PDF or DOCX file.",
+        "Commands:\n"
+        "/rate - choose rate\n"
+        "/rate 1.5 - set rate\n"
+        "/voice - choose voice\n"
+        "/settings - settings",
         reply_markup=main_keyboard(),
     )
 
 
 async def help_command(update, context):
     await update.effective_message.reply_text(
-        "📚 Speech Bot Help\n\n"
-        "Commands:\n"
-        "/start - Open menu\n"
-        "/help - Help\n"
-        "/settings - Settings\n\n"
-        "Supported files:\n"
-        "TXT, EPUB, PDF, DOCX\n\n"
-        "Speech Rate: 1.1x to 2.0x\n"
-        "Default voice: hi-IN-MadhurNeural\n\n"
-        "Google Translate TTS does not offer a named Madhur voice.",
+        "📚 Help\n\n"
+        "/start — show menu\n"
+        "/rate — select rate\n"
+        "/rate 1.1 through /rate 2.0 — set rate\n"
+        "/voice — select voice\n"
+        "/settings — settings\n"
+        "/cancel — cancel conversion\n\n"
+        "Supported files: TXT, EPUB, PDF, DOCX.",
         reply_markup=main_keyboard(),
     )
 
 
 async def settings_command(update, context):
     await update.effective_message.reply_text(
-        "⚙️ Speech Settings",
+        "⚙️ Settings",
         reply_markup=settings_keyboard(),
     )
+
+
+async def rate_command(update, context):
+    user_id = update.effective_user.id
+
+    if not context.args:
+        current = get_settings(user_id)["speed"]
+
+        await update.effective_message.reply_text(
+            f"Current rate: {current:.1f}x\n"
+            "Choose a button below or send /rate 1.5.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        f"{rate:.1f}x",
+                        callback_data=f"speed_{rate:.1f}",
+                    )
+                    for rate in VALID_RATES[index:index + 2]
+                ]
+                for index in range(0, len(VALID_RATES), 2)
+            ]),
+        )
+
+        return
+
+    try:
+        value = float(context.args[0])
+        value = round(value, 1)
+
+        if value not in VALID_RATES:
+            raise ValueError
+
+    except (ValueError, TypeError):
+        await update.effective_message.reply_text(
+            "❌ Invalid rate.\n"
+            "Use /rate 1.1 through /rate 2.0."
+        )
+        return
+
+    update_setting(user_id, "speed", value)
+
+    await update.effective_message.reply_text(
+        f"✅ Speech rate set to {value:.1f}x.\n"
+        "This rate will be used for your next conversion.",
+        reply_markup=main_keyboard(),
+    )
+
+
+async def voice_command(update, context):
+    await show_voices(update, context)
+
+
+async def cancel_command(update, context):
+    user_id = update.effective_user.id
+    task = ACTIVE_TASKS.get(user_id)
+
+    if task and not task.done():
+        task.cancel()
+
+        await update.effective_message.reply_text(
+            "⏹️ Cancellation requested."
+        )
+    else:
+        await update.effective_message.reply_text(
+            "No active conversion."
+        )
 
 
 # =========================================================
@@ -788,107 +831,109 @@ async def callback_handler(update, context):
         await query.edit_message_text(
             "✅ Microsoft Edge TTS selected."
         )
+        return
 
-    elif data == "engine_google":
+    if data == "engine_google":
         update_setting(user_id, "engine", "google")
 
         await query.edit_message_text(
-            "✅ Google Translate TTS selected.\n\n"
-            "Madhur voice is not available as a named "
-            "voice in Google Translate TTS."
+            "✅ Google Translate TTS selected.\n"
+            "Note: Google Translate TTS has no named Madhur voice."
         )
+        return
 
-    elif data == "menu_voices":
+    if data == "menu_voices":
         await show_voices(
             update,
             context,
-            use_callback=True,
+            from_callback=True,
         )
+        return
 
-    elif data == "menu_speed":
-        await show_speed(
+    if data == "menu_speed":
+        await show_rates(
             update,
             context,
-            use_callback=True,
+            from_callback=True,
         )
+        return
 
-    elif data == "menu_pitch":
+    if data == "menu_pitch":
         await show_pitch(
             update,
             context,
-            use_callback=True,
+            from_callback=True,
         )
+        return
 
-    elif data == "voice_madhur":
-        update_setting(
-            user_id,
-            "voice",
+    voices = {
+        "voice_madhur": (
             "hi-IN-MadhurNeural",
-        )
-
-        update_setting(user_id, "engine", "edge")
-
-        await query.edit_message_text(
-            "✅ Madhur Hindi male voice selected."
-        )
-
-    elif data == "voice_swara":
-        update_setting(
-            user_id,
-            "voice",
+            "Madhur Hindi male",
+        ),
+        "voice_swara": (
             "hi-IN-SwaraNeural",
-        )
+            "Swara Hindi female",
+        ),
+        "voice_sonia": (
+            "en-GB-SoniaNeural",
+            "Sonia English female",
+        ),
+    }
 
-        update_setting(user_id, "engine", "edge")
+    if data in voices:
+        voice_id, label = voices[data]
 
-        await query.edit_message_text(
-            "✅ Swara Hindi female voice selected."
-        )
-
-    elif data == "voice_sonia":
         update_setting(
             user_id,
             "voice",
-            "en-GB-SoniaNeural",
+            voice_id,
         )
 
-        update_setting(user_id, "engine", "edge")
+        update_setting(
+            user_id,
+            "engine",
+            "edge",
+        )
 
         await query.edit_message_text(
-            "✅ Sonia English voice selected."
+            f"✅ Selected voice: {label}"
         )
+        return
 
-    elif data.startswith("speed_"):
+    if data.startswith("speed_"):
         try:
-            speed = float(data.split("_", 1)[1])
+            rate = round(
+                float(data.split("_", 1)[1]),
+                1,
+            )
 
-            if not 1.1 <= speed <= 2.0:
-                raise ValueError("Invalid speed")
-
-            speed = round(speed, 1)
+            if rate not in VALID_RATES:
+                raise ValueError
 
             update_setting(
                 user_id,
                 "speed",
-                speed,
+                rate,
             )
 
             await query.edit_message_text(
-                f"✅ Speech Rate Updated!\n\n"
-                f"⚡ Selected Rate: {speed:.1f}x"
+                f"✅ Speech rate set to {rate:.1f}x."
             )
 
         except (ValueError, TypeError):
             await query.edit_message_text(
-                "❌ Invalid rate. Select 1.1x to 2.0x."
+                "❌ Invalid speech rate."
             )
 
-    elif data.startswith("pitch_"):
+        return
+
+    if data.startswith("pitch_"):
         try:
             pitch = int(data.split("_", 1)[1])
 
-            if pitch not in (-6, -3, 0, 3, 6):
-                raise ValueError("Invalid pitch")
+            if pitch not in VALID_PITCHES:
+                raise ValueError
 
             update_setting(
                 user_id,
@@ -902,12 +947,14 @@ async def callback_handler(update, context):
 
         except (ValueError, TypeError):
             await query.edit_message_text(
-                "❌ Invalid pitch value."
+                "❌ Invalid pitch."
             )
+
+        return
 
 
 # =========================================================
-# CONVERSION WORKER
+# CONVERSION DELIVERY
 # =========================================================
 
 async def process_text(
@@ -917,12 +964,12 @@ async def process_text(
     filename="audiobook",
 ):
     user_id = update.effective_user.id
-    current = ACTIVE_TASKS.get(user_id)
 
-    if current and not current.done():
+    active = ACTIVE_TASKS.get(user_id)
+
+    if active and not active.done():
         await update.effective_message.reply_text(
-            "⚠️ Your conversion is already running.\n"
-            "Cancel it before starting another."
+            "⚠️ A conversion is already running. Send /cancel first."
         )
         return
 
@@ -933,10 +980,13 @@ async def process_text(
         settings = get_settings(user_id)
 
         safe_name = re.sub(
-            r"[^a-zA-Z0-9_-]+",
+            r"[^A-Za-z0-9_-]+",
             "_",
             filename,
-        ).strip("_")[:60] or "audiobook"
+        ).strip("_")[:60]
+
+        if not safe_name:
+            safe_name = "audiobook"
 
         status = await update.effective_message.reply_text(
             "⏳ Preparing audio..."
@@ -947,11 +997,11 @@ async def process_text(
         ) as directory:
             output = Path(directory) / f"{safe_name}.mp3"
 
-            async def progress(index, total, stage):
+            async def progress(done, total, stage):
                 try:
                     await status.edit_text(
                         f"🎙️ {stage}\n"
-                        f"Progress: {index}/{total}"
+                        f"Progress: {done}/{total}"
                     )
                 except Exception:
                     pass
@@ -960,7 +1010,7 @@ async def process_text(
                 text,
                 settings,
                 output,
-                progress_callback=progress,
+                progress,
             )
 
             await status.edit_text(
@@ -993,12 +1043,11 @@ async def process_text(
         )
         raise
 
-    except Exception as error:
-        logger.exception("Audio conversion failed")
+    except Exception as exc:
+        logger.exception("Conversion failed")
 
         await update.effective_message.reply_text(
-            "❌ Conversion failed:\n"
-            f"{str(error)[:700]}"
+            f"❌ Conversion failed:\n{str(exc)[:700]}"
         )
 
     finally:
@@ -1007,7 +1056,7 @@ async def process_text(
 
 
 # =========================================================
-# TEXT HANDLER
+# MESSAGE HANDLERS
 # =========================================================
 
 async def text_handler(update, context):
@@ -1025,7 +1074,7 @@ async def text_handler(update, context):
 
     if text == "📄 Convert File":
         await message.reply_text(
-            "📄 Upload a TXT, EPUB, PDF or DOCX file."
+            "📄 Upload a TXT, EPUB, PDF, or DOCX file."
         )
         return
 
@@ -1038,7 +1087,7 @@ async def text_handler(update, context):
         return
 
     if text == "⚡ Speech Rate":
-        await show_speed(update, context)
+        await show_rates(update, context)
         return
 
     if text == "🎚️ Pitch":
@@ -1046,20 +1095,7 @@ async def text_handler(update, context):
         return
 
     if text == "❌ Cancel Task":
-        user_id = update.effective_user.id
-        task = ACTIVE_TASKS.get(user_id)
-
-        if task and not task.done():
-            task.cancel()
-
-            await message.reply_text(
-                "⏹️ Cancellation requested."
-            )
-        else:
-            await message.reply_text(
-                "ℹ️ No active conversion."
-            )
-
+        await cancel_command(update, context)
         return
 
     if text == "ℹ️ Help":
@@ -1074,10 +1110,6 @@ async def text_handler(update, context):
     )
 
 
-# =========================================================
-# FILE HANDLER
-# =========================================================
-
 async def document_handler(update, context):
     message = update.effective_message
     document = message.document
@@ -1086,22 +1118,21 @@ async def document_handler(update, context):
         return
 
     filename = document.file_name or "document.txt"
-    extension = Path(filename).suffix.lower()
+    ext = Path(filename).suffix.lower()
 
-    if extension not in (
+    if ext not in {
         ".txt",
         ".epub",
         ".pdf",
         ".docx",
-    ):
+    }:
         await message.reply_text(
-            "❌ Unsupported file.\n"
-            "Supported: TXT, EPUB, PDF, DOCX."
+            "❌ Supported formats: TXT, EPUB, PDF, DOCX."
         )
         return
 
     if (
-        document.file_size is not None
+        document.file_size
         and document.file_size > MAX_FILE_SIZE
     ):
         await message.reply_text(
@@ -1128,7 +1159,7 @@ async def document_handler(update, context):
             )
 
             await status.edit_text(
-                "📖 Extracting document text..."
+                "📖 Extracting text..."
             )
 
             text = await asyncio.to_thread(
@@ -1156,13 +1187,14 @@ async def document_handler(update, context):
                 filename=Path(filename).stem,
             )
 
-    except Exception as error:
-        logger.exception("Document processing failed")
+    except Exception as exc:
+        logger.exception(
+            "Document processing failed"
+        )
 
         try:
             await status.edit_text(
-                "❌ File processing failed:\n"
-                f"{str(error)[:700]}"
+                f"❌ File processing failed:\n{str(exc)[:700]}"
             )
         except Exception:
             pass
@@ -1173,46 +1205,58 @@ async def document_handler(update, context):
 # =========================================================
 
 async def post_init(application):
-    logger.info("Speech Bot initialized successfully.")
+    logger.info("Bot initialized.")
 
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN is missing. Add it to GitHub Secrets."
+            "BOT_TOKEN is missing from environment / GitHub Secrets."
         )
 
-    application = (
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
         .build()
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler("start", start)
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler("help", help_command)
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler("settings", settings_command)
     )
 
-    application.add_handler(
+    app.add_handler(
+        CommandHandler("rate", rate_command)
+    )
+
+    app.add_handler(
+        CommandHandler("voice", voice_command)
+    )
+
+    app.add_handler(
+        CommandHandler("cancel", cancel_command)
+    )
+
+    app.add_handler(
         CallbackQueryHandler(callback_handler)
     )
 
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
             filters.Document.ALL,
             document_handler,
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             text_handler,
@@ -1221,7 +1265,7 @@ def main():
 
     logger.info("Starting Telegram polling...")
 
-    application.run_polling(
+    app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=False,
     )
