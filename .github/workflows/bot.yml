@@ -1,0 +1,38 @@
+name: Levithan Voice AI
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+        run: |
+          test -n "$BOT_TOKEN" || (echo 'Missing GitHub secret BOT_TOKEN' && exit 1)
+
+          docker build -t levithan-voice-ai .
+
+          docker run --rm \
+            -e BOT_TOKEN="$BOT_TOKEN" \
+            -e HF_TOKEN="$HF_TOKEN" \
+            -e TTS_MODEL_ID=ai4bharat/indic-parler-tts \
+            levithan-voice-ai
