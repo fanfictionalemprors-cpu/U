@@ -1,14 +1,42 @@
+# Indic Parler-TTS Hindi Female Telegram Audiobook Bot
 
-# Offline Hindi Female Telegram Audiobook Bot
+This version uses AI4Bharat Indic Parler-TTS and adds a `/demo` command
+plus a Demo Voice button.
 
-TXT -> offline Piper Hindi female (Priyamvada) -> MP3 at 48 kbps mono. Edge TTS and gTTS are removed, so Edge 403 / Google gTTS 429 will not be used. Internet is needed only while Docker builds and downloads the model; speech synthesis itself is local.
+Features:
+- Hindi female voice description based on Divya
+- TXT upload and MP3 output
+- Playback speed options from 1.0x to 2.0x
+- Progress updates, duration, and ETA
+- 48 kbps mono MP3 parts
+- Local Telegram Bot API support
 
-## GitHub Actions secrets
-Set repository Actions secrets `BOT_TOKEN`, `TELEGRAM_API_ID`, and `TELEGRAM_API_HASH`.
+## Hugging Face setup
 
-## Important
-- Stop any other instance polling with the same BOT_TOKEN (for example Render) to avoid Telegram 409 Conflict.
-- The existing workflow uses a scheduled GitHub-hosted runner and restarts periodically. It is not a permanent server; uploads/conversion must finish while the job is alive.
-- `docker compose up -d --build` downloads the model at image-build time. First build is larger/slower. Model license and voice card are hosted by the Piper voices project; check the model's license before redistribution.
-- Speed buttons 1.0x–2.0x use FFmpeg `atempo` after local synthesis.
-- GitHub-hosted runner CPU is limited; offline local synthesis can be slower than hosted TTS, and a very large book may outlast a job run.
+1. Open https://huggingface.co/ai4bharat/indic-parler-tts
+2. Sign in and accept any required access conditions.
+3. Create a Hugging Face read access token.
+4. Add `HF_TOKEN` in GitHub repository Settings ->
+   Secrets and variables -> Actions.
+
+Also configure:
+- BOT_TOKEN
+- TELEGRAM_API_ID
+- TELEGRAM_API_HASH
+
+## Run
+
+Upload all project files, then open GitHub Actions and run the workflow.
+
+In Telegram:
+1. Send `/start`
+2. Tap Demo Voice
+3. Upload a TXT file
+4. Select speed from 1.0x to 2.0x
+
+The first model download may take several minutes. CPU synthesis can be
+slow for long books, so test the demo before uploading a large TXT file.
+
+Do not commit `.env` or share access tokens.
+Stop other processes using the same Telegram bot token to avoid
+409 Conflict errors.
