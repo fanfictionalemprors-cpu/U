@@ -1,52 +1,87 @@
-name: Levithan Voice AI
+name: Deploy Speech TTS Bot
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "bot.py"
+      - "requirements.txt"
+      - "Dockerfile"
+      - "render.yaml"
+      - ".github/workflows/deploy.yml"
 
-  schedule:
-    - cron: "0 */6 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: levithan-voice-ai
+  group: speech-tts-deployment
   cancel-in-progress: false
 
 jobs:
-  run-bot:
+  deploy:
+    name: Deploy to Render
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify secrets
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: Check required files
         run: |
-          if [ -z "$BOT_TOKEN" ]; then
-            echo "ERROR: BOT_TOKEN secret is missing"
+          set -e
+
+          for file in \
+            bot.py \
+            requirements.txt \
+            Dockerfile \
+            render.yaml
+          do
+            if [ ! -f "$file" ]; then
+              echo "ERROR: Missing file: $file"
+              exit 1
+            fi
+          done
+
+          echo "All required files found."
+
+      - name: Check Python syntax
+        run: |
+          python -m py_compile bot.py
+          echo "Python syntax check passed."
+
+      - name: Validate deployment secret
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK" ]; then
+            echo "ERROR: RENDER_DEPLOY_HOOK secret is missing."
             exit 1
           fi
 
-          if [ -z "$HF_TOKEN" ]; then
-            echo "WARNING: HF_TOKEN is empty"
-            echo "Public model access may still work."
-          fi
+          echo "Render deployment secret is configured."
 
-      - name: Build Docker image
-        run: docker build --no-cache -t levithan-voice-ai .
-
-      - name: Run Telegram bot
+      - name: Deploy to Render
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
         run: |
-          docker run --rm \
-            -e BOT_TOKEN="$BOT_TOKEN" \
-            -e HF_TOKEN="$HF_TOKEN" \
-            -e TTS_MODEL_ID="ai4bharat/indic-parler-tts" \
-            levithan-voice-ai
+          set -e
+
+          response=$(curl \
+            --silent \
+            --show-error \
+            --fail \
+            --retry 3 \
+            --retry-delay 5 \
+            --max-time 60 \
+            --request POST \
+            "$RENDER_DEPLOY_HOOK")
+
+          echo "Render deployment request accepted."
+
+          if [ -n "$response" ]; then
+            echo "$response"
+          fi
