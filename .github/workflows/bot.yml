@@ -4,10 +4,14 @@ on:
   workflow_dispatch:
 
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: read
+
+concurrency:
+  group: levithan-voice-ai
+  cancel-in-progress: false
 
 jobs:
   run-bot:
@@ -15,24 +19,34 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and run bot
+      - name: Verify secrets
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-
         run: |
-          test -n "$BOT_TOKEN" || (echo 'Missing GitHub secret BOT_TOKEN' && exit 1)
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "ERROR: BOT_TOKEN secret is missing"
+            exit 1
+          fi
 
-          docker build -t levithan-voice-ai .
+          if [ -z "$HF_TOKEN" ]; then
+            echo "WARNING: HF_TOKEN is empty"
+            echo "Public model access may still work."
+          fi
 
+      - name: Build Docker image
+        run: docker build --no-cache -t levithan-voice-ai .
+
+      - name: Run Telegram bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
           docker run --rm \
             -e BOT_TOKEN="$BOT_TOKEN" \
             -e HF_TOKEN="$HF_TOKEN" \
-            -e TTS_MODEL_ID=ai4bharat/indic-parler-tts \
+            -e TTS_MODEL_ID="ai4bharat/indic-parler-tts" \
             levithan-voice-ai
