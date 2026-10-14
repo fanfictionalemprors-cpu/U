@@ -1,0 +1,7 @@
+python-telegram-bot==21.11.1
+transformers==4.46.3
+parler-tts @ git+https://github.com/huggingface/parler-tts.git
+accelerate>=0.34.0
+soundfile>=0.12.1
+numpy<2.0
+safetensors>=0.4.5
