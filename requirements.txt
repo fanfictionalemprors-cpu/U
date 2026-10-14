@@ -1,5 +1,0 @@
-python-telegram-bot==21.11.1
-soundfile
-scipy
-numpy
-huggingface_hub
