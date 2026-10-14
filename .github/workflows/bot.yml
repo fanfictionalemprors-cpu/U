@@ -1,11 +1,10 @@
-name: Run Bot
+name: Run Offline Hindi Audiobook Bot
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"   # backup: agar chain toot jaye to dobara start
+    - cron: "0 */6 * * *"
 
-# Ek hi time par ek hi bot chale (do pollers = 409 conflict)
 concurrency:
   group: tts-bot
   cancel-in-progress: false
@@ -17,32 +16,45 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 355     # GitHub job limit 6 ghante
+    timeout-minutes: 355
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Write .env from secrets
+      - name: Create runtime environment
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           {
-            echo "BOT_TOKEN=${{ secrets.BOT_TOKEN }}"
-            echo "TELEGRAM_API_ID=${{ secrets.TELEGRAM_API_ID }}"
-            echo "TELEGRAM_API_HASH=${{ secrets.TELEGRAM_API_HASH }}"
-            echo "PART_MINUTES=180"
-            echo "CHUNK_CHARS=1000"
-            echo "TTS_CONCURRENCY=1"
-            echo "TTS_RETRIES=3"
-            echo "TTS_TIMEOUT_SECONDS=75"
+            printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN"
+            printf 'TELEGRAM_API_ID=%s\n' "$TELEGRAM_API_ID"
+            printf 'TELEGRAM_API_HASH=%s\n' "$TELEGRAM_API_HASH"
+            printf 'HF_TOKEN=%s\n' "$HF_TOKEN"
+            printf 'PART_MINUTES=180\n'
+            printf 'CHUNK_CHARS=350\n'
+            printf 'TORCH_NUM_THREADS=2\n'
           } > .env
 
-      - name: Start bot + local Telegram server
+          if [ -z "$BOT_TOKEN" ] || \
+             [ -z "$TELEGRAM_API_ID" ] || \
+             [ -z "$TELEGRAM_API_HASH" ] || \
+             [ -z "$HF_TOKEN" ]; then
+            echo "Missing required GitHub Actions secret(s)"
+            exit 1
+          fi
+
+      - name: Build and start bot + local Telegram API
         run: docker compose up -d --build
 
-      - name: Queue next run (relay)
+      - name: Queue next run
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run bot.yml --repo "${{ github.repository }}"
 
-      - name: Keep alive (~5h 45m)
+      - name: Keep alive
         run: |
           end=$((SECONDS + 20700))
           while [ $SECONDS -lt $end ]; do
@@ -50,8 +62,9 @@ jobs:
             docker compose ps --status running | grep -q bot || docker compose up -d
           done
 
-      - name: Stop
+      - name: Logs and stop
         if: always()
         run: |
-          docker compose logs --tail 50 bot || true
+          docker compose logs --tail 100 bot || true
+          docker compose logs --tail 50 tgapi || true
           docker compose down
