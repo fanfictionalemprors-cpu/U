@@ -2,29 +2,34 @@ services:
   tgapi:
     image: aiogram/telegram-bot-api:latest
     restart: always
+
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
       TELEGRAM_LOCAL: "1"
+
     volumes:
       - tgdata:/var/lib/telegram-bot-api
+
+    ports:
+      - "8081:8081"
 
   bot:
     build: .
     restart: always
+
     depends_on:
       - tgapi
+
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
-      HF_TOKEN: ${HF_TOKEN}
       LOCAL_API_URL: http://tgapi:8081
-      PART_MINUTES: ${PART_MINUTES:-180}
-      CHUNK_CHARS: ${CHUNK_CHARS:-350}
-      TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-2}
+      TTS_MODEL_DIR: /app/indus-pocket-tts
+      PART_MINUTES: ${PART_MINUTES:-30}
+      MAX_CHARS: ${MAX_CHARS:-450}
+
     volumes:
       - tgdata:/var/lib/telegram-bot-api
-      - hf-cache:/app/hf-cache
 
 volumes:
   tgdata:
-  hf-cache:
