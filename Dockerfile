@@ -13,19 +13,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CPU-only PyTorch first.
-RUN pip install --upgrade pip && \
-    pip install torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --upgrade pip
 
-# Install the bot dependencies.
 COPY requirements.txt .
+
 RUN pip install -r requirements.txt
 
-# Install the pinned Pocket TTS implementation.
-RUN pip install \
-    "pocket-tts @ git+https://github.com/kyutai-labs/pocket-tts@0c2db3b"
+RUN pip install "pocket-tts @ git+https://github.com/kyutai-labs/pocket-tts@0c2db3b"
 
-# Download the public Inaya Hindi/Hinglish model.
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+RUN pip install --upgrade huggingface_hub
+
 RUN hf download Indus-Labs/indus-pocket-tts \
     --local-dir /app/indus-pocket-tts
 
