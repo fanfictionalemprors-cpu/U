@@ -15,13 +15,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip
+RUN python -m pip install --upgrade pip setuptools wheel
 
-RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+RUN python -m pip install \
+    torch \
+    --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
 
-RUN pip install -r requirements.txt
+RUN python -m pip install -r requirements.txt
+
+RUN python -m pip install \
+    "git+https://github.com/huggingface/parler-tts.git"
+
+RUN python -m pip check
 
 COPY bot.py .
 
