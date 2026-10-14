@@ -1,21 +1,22 @@
-name: Run Offline Hindi Audiobook Bot
+name: Run Hindi Audiobook Bot
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "0 */6 * * *"
-
-concurrency:
-  group: telegram-audiobook-bot
-  cancel-in-progress: true
 
 permissions:
   contents: read
 
+concurrency:
+  group: telegram-audiobook-bot
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 355
 
     steps:
       - name: Checkout repository
@@ -26,107 +27,70 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          set -eu
+          set -e
 
-          [ -n "$BOT_TOKEN" ] || {
-            echo "ERROR: BOT_TOKEN secret missing"
+          test -n "$BOT_TOKEN" || {
+            echo "BOT_TOKEN secret is missing"
             exit 1
           }
 
-          [ -n "$TELEGRAM_API_ID" ] || {
-            echo "ERROR: TELEGRAM_API_ID secret missing"
+          test -n "$TELEGRAM_API_ID" || {
+            echo "TELEGRAM_API_ID secret is missing"
             exit 1
           }
 
-          [ -n "$TELEGRAM_API_HASH" ] || {
-            echo "ERROR: TELEGRAM_API_HASH secret missing"
+          test -n "$TELEGRAM_API_HASH" || {
+            echo "TELEGRAM_API_HASH secret is missing"
             exit 1
           }
 
-          [ -n "$HF_TOKEN" ] || {
-            echo "ERROR: HF_TOKEN secret missing"
-            exit 1
-          }
-
-          echo "All required secrets are configured."
+          echo "Required secrets are configured."
 
       - name: Create runtime environment
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          umask 077
           {
             printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN"
             printf 'TELEGRAM_API_ID=%s\n' "$TELEGRAM_API_ID"
             printf 'TELEGRAM_API_HASH=%s\n' "$TELEGRAM_API_HASH"
-            printf 'HF_TOKEN=%s\n' "$HF_TOKEN"
-            printf 'PART_MINUTES=180\n'
-            printf 'CHUNK_CHARS=350\n'
-            printf 'TORCH_NUM_THREADS=2\n'
+            printf 'PART_MINUTES=30\n'
+            printf 'MAX_CHARS=450\n'
           } > .env
 
-      - name: Build and start bot + local Telegram API
-        run: docker compose up -d --build
+          chmod 600 .env
 
-      - name: Verify containers started
+      - name: Build and start containers
         run: |
+          docker compose up -d --build
+
+      - name: Verify containers
+        run: |
+          sleep 20
           docker compose ps
-          sleep 15
-          docker compose ps
+          docker compose logs --tail=100 bot
 
           if ! docker compose ps --status running --services | grep -qx bot; then
-            echo "ERROR: Bot container is not running."
-            docker compose logs --tail 150 bot
+            echo "Bot container is not running."
+            docker compose logs --no-color bot
             exit 1
           fi
-
-          if ! docker compose ps --status running --services | grep -qx tgapi; then
-            echo "ERROR: Local Telegram API container is not running."
-            docker compose logs --tail 150 tgapi
-            exit 1
-          fi
-
-          echo "Bot and Local Telegram API containers are running."
 
       - name: Keep bot alive
         run: |
-          end=$((SECONDS + 20100))
-
-          while [ "$SECONDS" -lt "$end" ]; do
-            sleep 30
-
-            if ! docker compose ps --status running --services | grep -qx bot; then
-              echo "ERROR: Bot container stopped."
-              docker compose logs --tail 150 bot
-              exit 1
-            fi
-
-            if ! docker compose ps --status running --services | grep -qx tgapi; then
-              echo "ERROR: Local Telegram API stopped."
-              docker compose logs --tail 150 tgapi
-              exit 1
-            fi
-          done
+          echo "Bot is running."
+          echo "The runner will remain active for approximately 5 hours and 35 minutes."
+          sleep 20100
 
       - name: Show logs
         if: always()
         run: |
-          echo "========== BOT LOGS =========="
-          docker compose logs --tail 200 bot || true
-
-          echo "========== LOCAL API LOGS =========="
-          docker compose logs --tail 100 tgapi || true
-
-          echo "========== CONTAINER STATUS =========="
-          docker compose ps || true
+          docker compose logs --no-color --tail=300 || true
 
       - name: Stop containers
         if: always()
         run: |
           docker compose down || true
-          rm -f .env
