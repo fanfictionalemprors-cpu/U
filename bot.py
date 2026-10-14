@@ -1,4 +1,3 @@
-"""Offline Hindi audiobook Telegram bot using Piper TTS."""
 import asyncio
 import logging
 import os
@@ -6,11 +5,13 @@ import re
 import shutil
 import tempfile
 import time
-import wave
 from pathlib import Path
 
-from piper import PiperVoice
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import soundfile as sf
+import torch
+from parler_tts import ParlerTTSForConditionalGeneration
+from transformers import AutoTokenizer
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -22,15 +23,16 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 LOCAL_API = os.getenv("LOCAL_API_URL", "").rstrip("/")
-MODEL_PATH = Path(os.getenv("PIPER_MODEL", "/app/models/hi_IN-priyamvada-medium.onnx"))
-CONFIG_PATH = Path(os.getenv("PIPER_CONFIG", "/app/models/hi_IN-priyamvada-medium.onnx.json"))
-CHUNK_CHARS = max(300, int(os.getenv("CHUNK_CHARS", "1000")))
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+MODEL_ID = os.getenv("TTS_MODEL_ID", "ai4bharat/indic-parler-tts")
+CHUNK_CHARS = max(180, min(500, int(os.getenv("CHUNK_CHARS", "350"))))
 BITRATE_KBPS = 48
-PERFORMER = "Offline Hindi Audiobook"
-SAFETY = 0.96
+PERFORMER = "Indic Parler Hindi Audiobook"
+SAMPLE_RATE = 24000
+
 MAX_PART_BYTES = 2_000_000_000 if LOCAL_API else 50_000_000
 MAX_DOWNLOAD_BYTES = 2_000_000_000 if LOCAL_API else 20_000_000
-MAX_PART_SECONDS = MAX_PART_BYTES * SAFETY / (BITRATE_KBPS * 1000 / 8)
+MAX_PART_SECONDS = MAX_PART_BYTES * 0.96 / (BITRATE_KBPS * 1000 / 8)
 
 if LOCAL_API:
     MAX_PART_SECONDS = min(
@@ -38,33 +40,63 @@ if LOCAL_API:
         int(os.getenv("PART_MINUTES", "180")) * 60,
     )
 
+VOICE_DESCRIPTION = (
+    "Divya's voice is a natural, warm Hindi female voice, expressive and clear, "
+    "with a moderate speaking pace, natural pauses and a friendly storytelling tone. "
+    "The recording is very clear, close-mic, and has no background noise."
+)
+
+VOICE_LABEL = "🇮🇳 Hindi Female — Divya (Indic Parler-TTS)"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("piper-audiobook")
 
-VOICE_LABEL = "🇮🇳 Hindi Female — Priyamvada (Offline)"
-_piper_voice = None
+log = logging.getLogger("indic-parler-audiobook")
+
+torch.set_num_threads(
+    max(1, min(4, int(os.getenv("TORCH_NUM_THREADS", "2"))))
+)
+
+_model = None
+_tokenizer = None
+_description_tokenizer = None
 
 
-def get_voice():
-    global _piper_voice
+def get_model():
+    global _model, _tokenizer, _description_tokenizer
 
-    if _piper_voice is None:
-        if not MODEL_PATH.exists() or not CONFIG_PATH.exists():
+    if _model is None:
+        if not HF_TOKEN:
             raise RuntimeError(
-                f"Piper model files missing: {MODEL_PATH} and {CONFIG_PATH}"
+                "HF_TOKEN missing. Accept the model conditions on Hugging Face, "
+                "create a read token, then add it as GitHub Actions secret HF_TOKEN."
             )
 
-        log.info("Loading offline Piper voice model: %s", MODEL_PATH.name)
-        _piper_voice = PiperVoice.load(
-            str(MODEL_PATH),
-            config_path=str(CONFIG_PATH),
-        )
-        log.info("Piper voice model loaded")
+        log.info("Loading %s on CPU. First load may take several minutes.", MODEL_ID)
 
-    return _piper_voice
+        _model = ParlerTTSForConditionalGeneration.from_pretrained(
+            MODEL_ID,
+            token=HF_TOKEN,
+        ).to("cpu")
+
+        _tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_ID,
+            token=HF_TOKEN,
+        )
+
+        text_encoder_name = _model.config.text_encoder._name_or_path
+
+        _description_tokenizer = AutoTokenizer.from_pretrained(
+            text_encoder_name,
+            token=HF_TOKEN,
+        )
+
+        _model.eval()
+        log.info("Indic Parler-TTS model loaded.")
+
+    return _model, _tokenizer, _description_tokenizer
 
 
 def fmt_clock(seconds):
@@ -101,11 +133,13 @@ def split_text(text, limit=CHUNK_CHARS):
 
     for sentence in sentences:
         sentence = sentence.strip()
+
         if not sentence:
             continue
 
         while len(sentence) > limit:
             cut = sentence.rfind(" ", 0, limit)
+
             if cut < 1:
                 cut = limit
 
@@ -122,6 +156,7 @@ def split_text(text, limit=CHUNK_CHARS):
         if len(current) + len(sentence) + 1 > limit:
             if current:
                 chunks.append(current)
+
             current = sentence
         else:
             current = f"{current} {sentence}".strip()
@@ -133,54 +168,89 @@ def split_text(text, limit=CHUNK_CHARS):
 
 
 async def run(*cmd):
-    process = await asyncio.create_subprocess_exec(
+    proc = await asyncio.create_subprocess_exec(
         *map(str, cmd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
 
-    if process.returncode:
-        raise RuntimeError(stderr.decode(errors="replace")[-1800:])
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode:
+        raise RuntimeError(
+            stderr.decode(errors="replace")[-1800:]
+        )
 
     return stdout.decode(errors="replace").strip()
 
 
 async def audio_duration(path):
-    result = await run(
+    out = await run(
         "ffprobe",
         "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=nw=1:nk=1",
         path,
     )
-    return float(result)
+
+    return float(out)
 
 
 def synthesize_wav(text, wav_path):
-    """Generate speech locally using Piper."""
-    voice = get_voice()
+    model, tokenizer, description_tokenizer = get_model()
 
-    with wave.open(str(wav_path), "wb") as wav_file:
-        voice.synthesize(text, wav_file)
+    description_inputs = description_tokenizer(
+        VOICE_DESCRIPTION,
+        return_tensors="pt",
+    )
+
+    prompt_inputs = tokenizer(
+        text,
+        return_tensors="pt",
+    )
+
+    with torch.inference_mode():
+        generated = model.generate(
+            input_ids=description_inputs.input_ids,
+            attention_mask=description_inputs.attention_mask,
+            prompt_input_ids=prompt_inputs.input_ids,
+            prompt_attention_mask=prompt_inputs.attention_mask,
+            max_new_tokens=1536,
+        )
+
+    audio = generated.detach().cpu().numpy().squeeze()
+
+    if audio.size == 0:
+        raise RuntimeError("Indic Parler-TTS returned empty audio")
+
+    sf.write(
+        str(wav_path),
+        audio,
+        model.config.sampling_rate,
+    )
 
 
 async def tts_chunk(text, wav_path, mp3_path, rate):
     wav_path.unlink(missing_ok=True)
     mp3_path.unlink(missing_ok=True)
 
-    await asyncio.to_thread(synthesize_wav, text, wav_path)
+    await asyncio.to_thread(
+        synthesize_wav,
+        text,
+        wav_path,
+    )
 
     if not wav_path.exists() or wav_path.stat().st_size < 256:
-        raise RuntimeError("Piper ne khaali WAV banayi")
+        raise RuntimeError("TTS generated an empty WAV")
 
     await run(
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         "-i", wav_path,
         "-vn",
         "-filter:a", f"atempo={rate:.1f}",
         "-ac", "1",
-        "-ar", "24000",
+        "-ar", str(SAMPLE_RATE),
         "-b:a", f"{BITRATE_KBPS}k",
         mp3_path,
     )
@@ -188,7 +258,7 @@ async def tts_chunk(text, wav_path, mp3_path, rate):
     wav_path.unlink(missing_ok=True)
 
     if not mp3_path.exists() or mp3_path.stat().st_size < 256:
-        raise RuntimeError("FFmpeg ne khaali MP3 banayi")
+        raise RuntimeError("FFmpeg generated an empty MP3")
 
 
 async def concat_mp3(files, output):
@@ -199,82 +269,86 @@ async def concat_mp3(files, output):
         safe = file.resolve().as_posix().replace("'", "'\\''")
         lines.append(f"file '{safe}'\n")
 
-    listing.write_text("".join(lines), encoding="utf-8")
+    listing.write_text(
+        "".join(lines),
+        encoding="utf-8",
+    )
 
     try:
         await run(
-            "ffmpeg", "-y",
+            "ffmpeg",
+            "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", listing,
             "-c:a", "libmp3lame",
             "-b:a", f"{BITRATE_KBPS}k",
             "-ac", "1",
-            "-ar", "24000",
+            "-ar", str(SAMPLE_RATE),
             output,
         )
     finally:
         listing.unlink(missing_ok=True)
 
 
-# --------------------------------------------------
-# START MESSAGE + DEMO VOICE
-# --------------------------------------------------
-
-DEMO_TEXT = (
-    "नमस्ते! यह हिंदी फीमेल आवाज़ का डेमो है। "
-    "इस ऑडियोबुक बॉट में आप टेक्स्ट फ़ाइल को MP3 में बदल सकते हैं "
-    "और अपनी पसंद से एक से दो गुना तक स्पीड चुन सकते हैं।"
-)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "🔊 Demo Voice सुनें",
                 callback_data="demo",
             )
-        ],
+        ]
     ])
 
     await update.effective_message.reply_text(
-        "👋 Namaste! Offline Hindi Female Audiobook Bot\n\n"
-        "🔊 पहले Demo Voice दबाकर आवाज़ सुन सकते हो।\n"
-        "फिर अपनी .txt file भेजो और 1.0x से 2.0x speed चुनो।\n\n"
-        "Speech local Piper model से generate होगी; "
-        "Edge TTS/Google gTTS की जरूरत नहीं है।",
+        "👋 नमस्ते! Hindi Female Audiobook Bot\n\n"
+        "🔊 पहले Demo Voice सुनें दबाकर voice sample बनाएं।\n"
+        "फिर अपनी .txt file भेजें और 1.0x–2.0x speed चुनें।\n\n"
+        "पहली बार model Hugging Face से download होगा।",
         reply_markup=keyboard,
     )
 
 
-async def send_demo_voice(chat_id, context, status):
-    """Create and send a short Hindi female sample."""
-    work = Path(tempfile.mkdtemp(prefix="piper_demo_"))
+DEMO_TEXT = (
+    "नमस्ते! यह हिंदी महिला आवाज़ का डेमो है। "
+    "इस ऑडियोबुक बॉट में आप अपनी टेक्स्ट फ़ाइल को MP3 में बदल सकते हैं। "
+    "आप अपनी पसंद के अनुसार एक से दो गुना तक स्पीड चुन सकते हैं। "
+    "आइए, कहानी सुनना शुरू करते हैं।"
+)
+
+
+async def make_demo(chat_id, context, status):
+    work = Path(tempfile.mkdtemp(prefix="parler_demo_"))
+
     wav_path = work / "demo.wav"
     mp3_path = work / "Hindi_Female_Demo.mp3"
 
     try:
-        await asyncio.wait_for(
-            asyncio.to_thread(synthesize_wav, DEMO_TEXT, wav_path),
-            timeout=180,
+        await status.edit_text(
+            "🔊 Demo voice तैयार हो रही है। "
+            "पहली बार model download होने में समय लग सकता है..."
         )
 
         await asyncio.wait_for(
-            run(
-                "ffmpeg", "-y",
-                "-i", wav_path,
-                "-vn",
-                "-ac", "1",
-                "-ar", "24000",
-                "-b:a", f"{BITRATE_KBPS}k",
-                mp3_path,
+            asyncio.to_thread(
+                synthesize_wav,
+                DEMO_TEXT,
+                wav_path,
             ),
-            timeout=120,
+            timeout=1800,
         )
 
-        if not mp3_path.exists() or mp3_path.stat().st_size < 256:
-            raise RuntimeError("Demo MP3 खाली बनी")
+        await run(
+            "ffmpeg",
+            "-y",
+            "-i", wav_path,
+            "-vn",
+            "-ac", "1",
+            "-ar", str(SAMPLE_RATE),
+            "-b:a", f"{BITRATE_KBPS}k",
+            mp3_path,
+        )
 
         duration = await audio_duration(mp3_path)
 
@@ -282,66 +356,63 @@ async def send_demo_voice(chat_id, context, status):
             await context.bot.send_audio(
                 chat_id=chat_id,
                 audio=audio,
-                title="Hindi Female Voice Demo",
+                title="Hindi Female Divya Demo",
                 performer=PERFORMER,
                 duration=int(duration),
                 caption=(
-                    "🔊 Hindi Female — Priyamvada (Offline)\n"
-                    f"🎧 Duration: {fmt_clock(duration)}\n"
-                    "⚡ Demo speed: 1.0x"
+                    "🔊 Hindi Female — Divya\n"
+                    f"🎧 {fmt_clock(duration)}\n"
+                    "⚡ Demo: 1.0x"
                 ),
                 filename="Hindi_Female_Demo.mp3",
-                read_timeout=180,
-                write_timeout=180,
+                read_timeout=900,
+                write_timeout=900,
                 connect_timeout=60,
             )
 
         await status.edit_text(
-            "✅ Demo voice भेज दी है। अब अपनी .txt file भेजो।"
+            "✅ Demo audio भेज दी है। अब अपनी .txt file भेजें।"
         )
 
     except Exception as exc:
-        log.exception("Demo voice generation failed")
+        log.exception("Demo generation failed")
+
         await status.edit_text(
-            f"❌ Demo voice error: {str(exc)[:1000]}"
+            f"❌ Demo error: {str(exc)[:1500]}"
         )
 
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-async def demo_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def demo_callback(update, context):
     query = update.callback_query
-    await query.answer("Demo voice बना रहा हूँ…")
+    await query.answer("Demo तैयार कर रहा हूँ…")
 
     status = await query.message.reply_text(
-        "🔊 Hindi female demo voice generate हो रही है…"
+        "🔊 Hindi female demo तैयार हो रहा है..."
     )
 
-    await send_demo_voice(
+    await make_demo(
         query.message.chat_id,
         context,
         status,
     )
 
 
-async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def demo_command(update, context):
     status = await update.effective_message.reply_text(
-        "🔊 Demo voice generate हो रही है…"
+        "🔊 Demo voice तैयार हो रही है..."
     )
 
-    await send_demo_voice(
+    await make_demo(
         update.effective_chat.id,
         context,
         status,
     )
 
 
-# --------------------------------------------------
-# TXT FILE HANDLING
-# --------------------------------------------------
-
-async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_document(update, context):
     doc = update.effective_message.document
 
     if not doc or not (doc.file_name or "").lower().endswith(".txt"):
@@ -358,16 +429,16 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("job"):
         await update.effective_message.reply_text(
-            "⚠️ Pehli file ka selection pending hai. "
-            "Pehle uska process complete karo."
+            "⚠️ Pehli file ka selection pending hai."
         )
         return
 
-    work = Path(tempfile.mkdtemp(prefix="piper_tts_"))
+    work = Path(tempfile.mkdtemp(prefix="parler_tts_"))
 
     try:
         telegram_file = await context.bot.get_file(doc.file_id)
         input_path = work / "input.txt"
+
         await telegram_file.download_to_drive(input_path)
 
         text = input_path.read_text(
@@ -377,6 +448,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not text.strip():
             shutil.rmtree(work, ignore_errors=True)
+
             await update.effective_message.reply_text(
                 "❌ TXT file khaali hai."
             )
@@ -415,12 +487,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         shutil.rmtree(work, ignore_errors=True)
         log.exception("TXT download failed")
+
         await update.effective_message.reply_text(
             f"❌ File read error: {str(exc)[:700]}"
         )
 
 
-async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_rate(update, context):
     query = update.callback_query
     await query.answer()
 
@@ -439,13 +512,15 @@ async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError("Invalid rate")
 
     except Exception:
-        await query.edit_message_text("Invalid speed selection.")
+        await query.edit_message_text(
+            "Invalid speed selection."
+        )
         return
 
     context.user_data["job"] = None
 
     status = await query.edit_message_text(
-        "⏳ Offline Piper TTS start ho raha hai…\n"
+        "⏳ Offline Parler-TTS start ho raha hai...\n"
         f"Speed: {rate:.1f}x"
     )
 
@@ -460,16 +535,12 @@ async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# --------------------------------------------------
-# AUDIOBOOK CONVERSION
-# --------------------------------------------------
-
 async def process(status, context, job, chat_id, rate):
     work = job["dir"]
     started = time.monotonic()
 
     try:
-        await asyncio.to_thread(get_voice)
+        await asyncio.to_thread(get_model)
 
         text = job["path"].read_text(
             encoding="utf-8-sig",
@@ -482,21 +553,20 @@ async def process(status, context, job, chat_id, rate):
             raise RuntimeError("TXT mein readable text nahi mila")
 
         total = len(chunks)
+
         mp3_files = [
             work / f"chunk_{i:05d}.mp3"
             for i in range(total)
         ]
 
+        durations = [0.0] * total
+
         await status.edit_text(
-            "🎙 <b>Offline audiobook ban raha hai</b>\n"
-            f"{VOICE_LABEL}\n"
+            "🎙 <b>Audiobook बन रहा है</b>\n"
             f"{progress_bar(0)} <b>0%</b> (0/{total})\n"
-            f"⚡ Speed: {rate:.1f}x\n"
-            "⏱ Elapsed: 0:00:00 | ETA: calculating...",
+            f"⚡ Speed: {rate:.1f}x",
             parse_mode="HTML",
         )
-
-        durations = [0.0] * total
 
         for i, chunk in enumerate(chunks):
             wav_path = work / f"chunk_{i:05d}.wav"
@@ -513,18 +583,24 @@ async def process(status, context, job, chat_id, rate):
             done = i + 1
             elapsed = time.monotonic() - started
             percent = int(done * 100 / total)
-            completed_audio = sum(durations[:done])
+            completed_duration = sum(durations[:done])
+
             estimated_total = (
-                completed_audio / done * total if done else 0
+                completed_duration / done * total
+                if done else 0
             )
-            eta = elapsed / done * (total - done) if done else 0
+
+            eta = (
+                elapsed / done * (total - done)
+                if done else 0
+            )
 
             try:
                 await status.edit_text(
-                    "🎙 <b>Offline audiobook ban raha hai</b>\n"
+                    "🎙 <b>Audiobook बन रहा है</b>\n"
                     f"{progress_bar(percent)} <b>{percent}%</b> "
-                    f"({done}/{total} chunks)\n"
-                    f"🎧 Completed audio: {fmt_clock(completed_audio)}\n"
+                    f"({done}/{total})\n"
+                    f"🎧 Completed: {fmt_clock(completed_duration)}\n"
                     f"🎵 Estimated total: {fmt_clock(estimated_total)}\n"
                     f"⚡ Speed: {rate:.1f}x\n"
                     f"⏱ Elapsed: {fmt_clock(elapsed)} | "
@@ -544,7 +620,10 @@ async def process(status, context, job, chat_id, rate):
         current_duration = 0.0
 
         for file, duration in zip(mp3_files, durations):
-            if current and current_duration + duration > MAX_PART_SECONDS:
+            if (
+                current
+                and current_duration + duration > MAX_PART_SECONDS
+            ):
                 parts.append((current, current_duration))
                 current = []
                 current_duration = 0.0
@@ -557,20 +636,20 @@ async def process(status, context, job, chat_id, rate):
 
         for index, (group, duration) in enumerate(parts, 1):
             await status.edit_text(
-                "📤 <b>MP3 parts bhej raha hoon</b>\n"
+                "📤 <b>Parts भेज रहे हैं</b>\n"
                 f"{progress_bar((index - 1) * 100 // len(parts))} "
-                f"{index - 1}/{len(parts)} parts\n"
-                f"🎧 Total duration: {fmt_clock(total_duration)}\n"
-                f"📀 Current part: {fmt_clock(duration)}",
+                f"{index - 1}/{len(parts)}\n"
+                f"🎧 Total: {fmt_clock(total_duration)}",
                 parse_mode="HTML",
             )
 
             output = work / f"{job['name']} - Part {index}.mp3"
+
             await concat_mp3(group, output)
 
             if output.stat().st_size > MAX_PART_BYTES:
                 raise RuntimeError(
-                    f"Part {index} Telegram size limit se bada hai"
+                    f"Part {index} Telegram size limit से बड़ी है"
                 )
 
             with output.open("rb") as audio:
@@ -596,9 +675,9 @@ async def process(status, context, job, chat_id, rate):
         await status.edit_text(
             "✅ <b>Audiobook complete!</b>\n"
             f"{progress_bar(100)} <b>100%</b>\n"
-            f"🎧 Total duration: {fmt_clock(total_duration)}\n"
+            f"🎧 Total: {fmt_clock(total_duration)}\n"
             f"📀 Parts: {len(parts)}\n"
-            f"⏱ Processing time: "
+            f"⏱ Processing: "
             f"{fmt_clock(time.monotonic() - started)}",
             parse_mode="HTML",
         )
@@ -618,35 +697,48 @@ async def process(status, context, job, chat_id, rate):
 
 
 def main():
-    if not BOT_TOKEN or BOT_TOKEN == "PASTE_TOKEN_HERE":
+    if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN GitHub Actions secret/environment mein set nahi hai"
+            "BOT_TOKEN environment variable missing"
         )
+
+    builder = Application.builder().token(BOT_TOKEN)
 
     if LOCAL_API:
         builder = (
-            Application.builder()
-            .token(BOT_TOKEN)
+            builder
             .base_url(f"{LOCAL_API}/bot")
             .base_file_url(f"{LOCAL_API}/file/bot")
             .local_mode(True)
         )
-    else:
-        builder = Application.builder().token(BOT_TOKEN)
 
     app = builder.build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("demo", demo_command))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+
     app.add_handler(
-        CallbackQueryHandler(demo_voice, pattern=r"^demo$")
-    )
-    app.add_handler(
-        CallbackQueryHandler(on_rate, pattern=r"^r:")
+        MessageHandler(filters.Document.ALL, on_document)
     )
 
-    log.info("Bot starting; offline Piper Hindi female voice selected")
+    app.add_handler(
+        CallbackQueryHandler(
+            demo_callback,
+            pattern=r"^demo$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            on_rate,
+            pattern=r"^r:",
+        )
+    )
+
+    log.info(
+        "Starting Telegram bot with Indic Parler-TTS (CPU)"
+    )
+
     app.run_polling(drop_pending_updates=False)
 
 
