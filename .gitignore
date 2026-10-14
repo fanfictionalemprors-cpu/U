@@ -1,0 +1,11 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+bot_data/
+*.mp3
+*.epub
+*.pdf
+*.docx
+*.txt
