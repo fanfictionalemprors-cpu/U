@@ -16,12 +16,15 @@ services:
       - tgapi
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
+      HF_TOKEN: ${HF_TOKEN}
       LOCAL_API_URL: http://tgapi:8081
       PART_MINUTES: ${PART_MINUTES:-180}
+      CHUNK_CHARS: ${CHUNK_CHARS:-350}
+      TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-2}
     volumes:
-      # same path chahiye taaki bot server ki downloaded files padh sake
       - tgdata:/var/lib/telegram-bot-api
+      - hf-cache:/app/hf-cache
 
 volumes:
   tgdata:
-
+  hf-cache:
