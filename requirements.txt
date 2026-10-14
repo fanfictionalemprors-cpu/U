@@ -1,6 +1,7 @@
-python-telegram-bot==21.11.1
-transformers==4.46.3
-accelerate==1.1.1
-soundfile==0.12.1
-numpy==1.26.4
-safetensors==0.4.5
+python-telegram-bot>=21.10,<23.0
+edge-tts>=7.0.0
+gTTS>=2.5.0
+pypdf>=5.0.0
+python-docx>=1.1.0
+EbookLib>=0.18
+beautifulsoup4>=4.12.0
