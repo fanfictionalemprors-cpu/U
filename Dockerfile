@@ -1,40 +1,36 @@
 FROM python:3.11-slim
 
-ENV PYTHONUNBUFFERED=1 \
-    HF_HOME=/app/hf-cache \
-    HF_HUB_CACHE=/app/hf-cache \
-    TRANSFORMERS_CACHE=/app/hf-cache \
-    CHUNK_CHARS=350 \
-    TORCH_NUM_THREADS=2 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV OMP_NUM_THREADS=2
+ENV MKL_NUM_THREADS=2
+
+WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    libsndfile1 \
-    libgomp1 \
-    libstdc++6 \
     git \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Install CPU-only PyTorch first.
+RUN pip install --upgrade pip && \
+    pip install torch --index-url https://download.pytorch.org/whl/cpu
 
+# Install the bot dependencies.
 COPY requirements.txt .
+RUN pip install -r requirements.txt
 
-# Install a matching CPU-only PyTorch and torchaudio pair.
-RUN pip install --no-cache-dir \
-    torch==2.5.1 torchaudio==2.5.1 \
-    --index-url https://download.pytorch.org/whl/cpu
+# Install the pinned Pocket TTS implementation.
+RUN pip install \
+    "pocket-tts @ git+https://github.com/kyutai-labs/pocket-tts@0c2db3b"
 
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install the Parler-TTS library.
-RUN pip install --no-cache-dir \
-    git+https://github.com/huggingface/parler-tts.git
-
-# Verify the native audio libraries before starting the bot.
-RUN python -c "import torch, torchaudio, soundfile; print('Torch:', torch.__version__); print('Torchaudio:', torchaudio.__version__); print('Audio libraries OK')"
+# Download the public Inaya Hindi/Hinglish model.
+RUN hf download Indus-Labs/indus-pocket-tts \
+    --local-dir /app/indus-pocket-tts
 
 COPY bot.py .
 
-CMD ["python", "bot.py"]
+ENV TTS_MODEL_DIR=/app/indus-pocket-tts
+
+CMD ["python", "-u", "bot.py"]
