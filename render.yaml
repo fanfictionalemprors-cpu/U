@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: speech-tts-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
