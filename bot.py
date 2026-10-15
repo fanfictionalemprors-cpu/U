@@ -25,6 +25,21 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 CHUNK_SIZE = 2800
 TTS_CONCURRENCY = 4  # Parallel TTS requests; set to 2 if rate-limited.
 DEFAULT_SETTINGS = {"engine": "edge", "voice": "hi-IN-MadhurNeural", "rate": 1.1, "pitch": 0}
+
+def proxy_url():
+    """Build authenticated HTTP proxy URL from GitHub Actions secrets."""
+    host = os.getenv("PROXY_HOST", "").strip()
+    port = os.getenv("PROXY_PORT", "80").strip()
+    username = os.getenv("PROXY_USERNAME", "").strip()
+    password = os.getenv("PROXY_PASSWORD", "").strip()
+    if not host or not port or not username or not password:
+        return None
+    from urllib.parse import quote
+    user = quote(username, safe="")
+    pwd = quote(password, safe="")
+    return f"http://{user}:{pwd}@{host}:{port}"
+
+PROXY_URL = proxy_url()
 SETTINGS = {}
 ACTIVE = {}
 CANCEL = set()
@@ -87,7 +102,10 @@ def edge_rate(rate):
     return f"{round((float(rate) - 1) * 100):+d}%"
 
 def make_google(text, out, rate):
-    gTTS(text=text, lang="hi", slow=False).save(str(out))
+    requests_kwargs = {}
+    if PROXY_URL:
+        requests_kwargs["proxies"] = {"http": PROXY_URL, "https": PROXY_URL}
+    gTTS(text=text, lang="hi", slow=False, requests_kwargs=requests_kwargs).save(str(out))
     if abs(rate - 1) > 0.01:
         temp = out.with_name(out.stem + "_speed.mp3")
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(out),
@@ -99,17 +117,22 @@ async def make_audio(text, out, p):
     if p["engine"] == "google":
         await asyncio.to_thread(make_google, text, out, p["rate"])
     else:
-        await edge_tts.Communicate(
-            text=text, voice=p["voice"], rate=edge_rate(p["rate"]),
-            pitch=f"{int(p['pitch']):+d}Hz"
-        ).save(str(out))
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=p["voice"],
+            rate=edge_rate(p["rate"]),
+            pitch=f"{int(p['pitch']):+d}Hz",
+            proxy=PROXY_URL,
+        )
+        await communicate.save(str(out))
 
 def merge(files, output, workdir):
-    concat = workdir / "concat.txt"
+    """Join compatible MP3 chunks without re-encoding (faster and avoids quality loss)."""
+    concat = workdir / (output.stem + "_concat.txt")
     concat.write_text("\n".join("file '" + str(f.resolve()).replace("'", r"'\''") + "'" for f in files),
                       encoding="utf-8")
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-                    "-i", str(concat), "-c:a", "libmp3lame", "-q:a", "4", str(output)], check=True)
+                    "-i", str(concat), "-c", "copy", str(output)], check=True)
 
 def fmt_seconds(seconds):
     if seconds is None or seconds < 0: return "calculating…"
@@ -230,81 +253,175 @@ async def convert(update, context, filename):
     doc = msg.document
     p = prefs(uid).copy()
     input_size = doc.file_size or 0
-    status = await msg.reply_text(f"📥 Downloading: {filename}\n📦 Input file size: {input_size / 1048576:.2f} MB")
+    # Keep generated audio segments below Telegram's practical 50 MB upload ceiling.
+    TARGET_PART_BYTES = 48 * 1024 * 1024
+    status = await msg.reply_text(
+        f"📥 Downloading: {filename}\n📦 Input file size: {input_size / 1048576:.2f} MB\n"
+        f"📤 Output parts target: 48 MB"
+    )
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="tts_") as td:
         wd = Path(td)
         source = wd / Path(filename).name
         tgfile = await context.bot.get_file(doc.file_id)
         await tgfile.download_to_drive(custom_path=str(source))
-        await status.edit_text(f"📖 Extracting text…\n📦 Input file size: {input_size / 1048576:.2f} MB")
+        await status.edit_text(f"📖 Extracting text…\n📦 Input size: {input_size / 1048576:.2f} MB")
         text = await asyncio.to_thread(extract, source)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         if not text:
-            await status.edit_text("❌ No readable text found."); return
+            await status.edit_text("❌ No readable text found.")
+            return
         if len(text) > MAX_TEXT_LENGTH:
-            await status.edit_text(f"❌ Text has {len(text):,} characters; limit is {MAX_TEXT_LENGTH:,}. Split the book into smaller files."); return
+            await status.edit_text(
+                f"❌ Text has {len(text):,} characters; limit is {MAX_TEXT_LENGTH:,}. Split the book into smaller files."
+            )
+            return
         chunks = split_text(text)
         if not chunks:
-            await status.edit_text("❌ No text to convert."); return
-        total = len(chunks)
+            await status.edit_text("❌ No text to convert.")
+            return
+
+        total_chunks = len(chunks)
         estimated_audio = estimate_audio_seconds(text, p["rate"])
         completed = 0
-        audio_parts = [None] * total
-        lock = asyncio.Lock()
+        sent_parts = 0
+        pending_audio = []
+        pending_bytes = 0
+        total_sent_bytes = 0
+        total_sent_duration = 0.0
+        size_mb = lambda n: n / (1024 * 1024)
 
-        async def render_one(index, chunk):
-            nonlocal completed
-            if uid in CANCEL: raise asyncio.CancelledError()
-            out = wd / f"part_{index + 1:05d}.mp3"
-            await make_audio(chunk, out, p)
-            async with lock:
-                audio_parts[index] = out
-                completed += 1
-                elapsed = time.monotonic() - started
-                eta = (elapsed / max(1, completed)) * (total - completed)
+        async def send_pending(final=False):
+            nonlocal sent_parts, pending_audio, pending_bytes, total_sent_bytes, total_sent_duration
+            if not pending_audio:
+                return
+            sent_parts += 1
+            output = wd / f"{Path(filename).stem[:55]}_part_{sent_parts:03d}.mp3"
+            await status.edit_text(
+                f"📦 Preparing part {sent_parts}…\n"
+                f"Part size before merge: {size_mb(pending_bytes):.2f} MB\n"
+                f"🎙️ Conversion: {progress_bar(completed, total_chunks)} {completed * 100 // total_chunks}%\n"
+                f"⌛ Used time: {fmt_seconds(time.monotonic() - started)}"
+            )
+            await asyncio.to_thread(merge, list(pending_audio), output, wd)
+            output_bytes = output.stat().st_size
+            duration = probe_duration(output)
+            # A safety check: the target is 48 MiB, so this should normally stay below 49 MiB.
+            if output_bytes > 49 * 1024 * 1024:
                 await status.edit_text(
-                    f"🎙️ Converting audiobook\n{progress_bar(completed, total)} {completed * 100 // total}% ({completed:,}/{total:,})\n\n"
-                    f"📦 Input size: {input_size / 1048576:.2f} MB\n📝 Characters: {len(text):,}\n"
-                    f"🔊 Estimated audio duration: ~{fmt_seconds(estimated_audio)}\n"
-                    f"⏳ Estimated time remaining: ~{fmt_seconds(eta)}\n⌛ Used time: {fmt_seconds(elapsed)}\n"
-                    f"⚡ Engine: {p['engine']} | Rate: {p['rate']:.1f}x | Parallel: {TTS_CONCURRENCY}")
-
-        semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
-        async def limited_render(i, chunk):
-            async with semaphore:
-                if uid in CANCEL: raise asyncio.CancelledError()
-                await render_one(i, chunk)
+                    f"⚠️ Part {sent_parts} merged to {size_mb(output_bytes):.2f} MB, over 49 MB. "
+                    "It will be split into smaller audio files instead."
+                )
+                # Split this oversized joined file into shorter segments by stream-copying at 25 minutes.
+                split_dir = wd / f"split_{sent_parts:03d}"
+                split_dir.mkdir(exist_ok=True)
+                pattern = split_dir / "segment_%03d.mp3"
+                subprocess.run([
+                    "ffmpeg", "-y", "-loglevel", "error", "-i", str(output),
+                    "-f", "segment", "-segment_time", "1500", "-c", "copy", str(pattern)
+                ], check=True)
+                output.unlink(missing_ok=True)
+                segments = sorted(split_dir.glob("segment_*.mp3"))
+                for seg in segments:
+                    seg_bytes = seg.stat().st_size
+                    seg_duration = probe_duration(seg)
+                    with seg.open("rb") as f:
+                        await msg.reply_document(
+                            document=f, filename=f"{Path(filename).stem[:45]}_part_{sent_parts:03d}_{seg.name}",
+                            caption=(f"✅ Audio part {sent_parts} (split)\n📦 Size: {size_mb(seg_bytes):.2f} MB\n"
+                                     f"🔊 Duration: {fmt_seconds(seg_duration)}\n⌛ Used time: {fmt_seconds(time.monotonic()-started)}"),
+                            read_timeout=300, write_timeout=300, connect_timeout=60
+                        )
+                    total_sent_bytes += seg_bytes
+                    total_sent_duration += seg_duration or 0
+            else:
+                with output.open("rb") as f:
+                    await msg.reply_document(
+                        document=f,
+                        filename=output.name,
+                        caption=(
+                            f"✅ Audiobook part {sent_parts}\n"
+                            f"📦 Part size: {size_mb(output_bytes):.2f} MB\n"
+                            f"🔊 Audio duration: {fmt_seconds(duration)}\n"
+                            f"📚 Overall progress: {completed:,}/{total_chunks:,} chunks "
+                            f"({completed * 100 // total_chunks}%)\n"
+                            f"⏳ Estimated total audio: ~{fmt_seconds(estimated_audio)}\n"
+                            f"⌛ Used time: {fmt_seconds(time.monotonic()-started)}\n"
+                            f"⚡ Engine: {p['engine']} | Rate: {p['rate']:.1f}x"
+                        ),
+                        read_timeout=300, write_timeout=300, connect_timeout=60
+                    )
+                total_sent_bytes += output_bytes
+                total_sent_duration += duration or 0
+            # Clear this batch; generation continues for remaining chunks.
+            pending_audio = []
+            pending_bytes = 0
+            output.unlink(missing_ok=True)
+            await status.edit_text(
+                f"📤 Sent part {sent_parts} successfully\n"
+                f"📦 Sent so far: {size_mb(total_sent_bytes):.2f} MB\n"
+                f"🔊 Sent audio duration: {fmt_seconds(total_sent_duration)}\n"
+                f"🎙️ Progress: {progress_bar(completed, total_chunks)} {completed * 100 // total_chunks}% "
+                f"({completed:,}/{total_chunks:,} chunks)\n"
+                f"⏳ Estimated total audio: ~{fmt_seconds(estimated_audio)}\n"
+                f"⌛ Used time: {fmt_seconds(time.monotonic() - started)}\n"
+                f"🚀 Continuing to generate remaining audio…"
+            )
 
         await status.edit_text(
-            f"🚀 Starting parallel conversion\n{progress_bar(0, total)} 0% (0/{total:,})\n\n"
-            f"📦 Input size: {input_size / 1048576:.2f} MB\n📝 Characters: {len(text):,}\n"
-            f"🔊 Estimated audio duration: ~{fmt_seconds(estimated_audio)}\n"
-            f"⏳ Estimated time remaining: calculating…\n⌛ Used time: 0s\n"
-            f"⚡ Engine: {p['engine']} | Rate: {p['rate']:.1f}x | Parallel: {TTS_CONCURRENCY}")
-        try:
-            await asyncio.gather(*(limited_render(i, chunk) for i, chunk in enumerate(chunks)))
-        except asyncio.CancelledError:
-            raise
-        if uid in CANCEL: raise asyncio.CancelledError()
-        parts = [x for x in audio_parts if x is not None]
-        await status.edit_text(f"🔗 Merging audio…\n{progress_bar(total, total)} 100%\n⌛ Used time: {fmt_seconds(time.monotonic()-started)}")
-        output = wd / (Path(filename).stem[:70] + "_audiobook.mp3")
-        await asyncio.to_thread(merge, parts, output, wd)
-        actual_duration = probe_duration(output)
-        output_size = output.stat().st_size
-        elapsed = time.monotonic() - started
-        if output_size > 49 * 1024 * 1024:
-            await status.edit_text(f"⚠️ MP3 is {output_size/1048576:.2f} MB, too large to send as one file.\n🔊 Audio duration: {fmt_seconds(actual_duration)}\n⌛ Used time: {fmt_seconds(elapsed)}\nTry smaller input files."); return
-        await status.edit_text(f"📤 Uploading MP3…\n📦 Output size: {output_size/1048576:.2f} MB\n🔊 Audio duration: {fmt_seconds(actual_duration)}\n⌛ Used time: {fmt_seconds(elapsed)}")
-        with output.open("rb") as f:
-            await msg.reply_document(document=f, filename=output.name,
-                caption=(f"✅ Audiobook ready\n📦 Input: {input_size/1048576:.2f} MB\n📦 MP3 size: {output_size/1048576:.2f} MB\n"
-                         f"🔊 Audio duration: {fmt_seconds(actual_duration)}\n📝 Characters: {len(text):,}\n🎙️ Chunks: {len(parts):,}\n"
-                         f"⏳ Estimated audio: ~{fmt_seconds(estimated_audio)}\n⌛ Used time: {fmt_seconds(elapsed)}\n"
-                         f"⚡ Engine: {p['engine']} | Rate: {p['rate']:.1f}x"),
-                read_timeout=300, write_timeout=300, connect_timeout=60)
-        await status.edit_text(f"✅ Complete!\n{progress_bar(total,total)} 100%\n📦 MP3 size: {output_size/1048576:.2f} MB\n🔊 Audio duration: {fmt_seconds(actual_duration)}\n⌛ Used time: {fmt_seconds(elapsed)}")
+            f"🚀 Starting conversion\n{progress_bar(0, total_chunks)} 0% (0/{total_chunks:,})\n\n"
+            f"📦 Input size: {size_mb(input_size):.2f} MB\n📝 Characters: {len(text):,}\n"
+            f"🔊 Estimated total audio: ~{fmt_seconds(estimated_audio)}\n"
+            f"📤 Auto-send threshold: 48 MB per part\n"
+            f"⚡ Engine: {p['engine']} | Rate: {p['rate']:.1f}x | Parallel: {TTS_CONCURRENCY}"
+        )
+
+        # Process small waves concurrently. As soon as accumulated audio reaches ~48 MiB,
+        # merge/send that part while the remaining novel is still waiting to be generated.
+        for batch_start in range(0, total_chunks, TTS_CONCURRENCY):
+            if uid in CANCEL:
+                raise asyncio.CancelledError()
+            batch = list(enumerate(chunks[batch_start:batch_start + TTS_CONCURRENCY], start=batch_start))
+            async def render(index, chunk):
+                out = wd / f"chunk_{index + 1:06d}.mp3"
+                await make_audio(chunk, out, p)
+                return index, out
+            results = await asyncio.gather(*(render(i, chunk) for i, chunk in batch))
+            for index, out in sorted(results, key=lambda item: item[0]):
+                if uid in CANCEL:
+                    raise asyncio.CancelledError()
+                pending_audio.append(out)
+                pending_bytes += out.stat().st_size
+                completed += 1
+                elapsed = time.monotonic() - started
+                eta = (elapsed / max(1, completed)) * (total_chunks - completed)
+                # Avoid Telegram message-edit rate limits; always refresh at the send threshold.
+                if completed % 5 == 0 or pending_bytes >= TARGET_PART_BYTES or completed == total_chunks:
+                    await status.edit_text(
+                        f"🎙️ Converting audiobook\n{progress_bar(completed, total_chunks)} "
+                        f"{completed * 100 // total_chunks}% ({completed:,}/{total_chunks:,} chunks)\n\n"
+                        f"📦 Input size: {size_mb(input_size):.2f} MB\n"
+                        f"📦 Current unsent audio: {size_mb(pending_bytes):.2f} / 48 MB\n"
+                        f"🔊 Estimated total audio: ~{fmt_seconds(estimated_audio)}\n"
+                        f"⏳ Estimated time remaining: ~{fmt_seconds(eta)}\n"
+                        f"⌛ Used time: {fmt_seconds(elapsed)}\n"
+                        f"📤 Parts already sent: {sent_parts}\n"
+                        f"⚡ Engine: {p['engine']} | Rate: {p['rate']:.1f}x | Parallel: {TTS_CONCURRENCY}"
+                    )
+                if pending_bytes >= TARGET_PART_BYTES:
+                    await send_pending()
+
+        if uid in CANCEL:
+            raise asyncio.CancelledError()
+        if pending_audio:
+            await send_pending(final=True)
+
+        await status.edit_text(
+            f"✅ All audio sent!\n{progress_bar(total_chunks, total_chunks)} 100%\n"
+            f"📤 Parts sent: {sent_parts}\n📦 Total sent size: {size_mb(total_sent_bytes):.2f} MB\n"
+            f"🔊 Total audio duration: {fmt_seconds(total_sent_duration)}\n"
+            f"⌛ Total used time: {fmt_seconds(time.monotonic() - started)}"
+        )
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -361,6 +478,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
+    log.info("Proxy configured: %s", bool(PROXY_URL))
     log.info("Starting polling bot")
     app.run_polling(drop_pending_updates=True)
 
