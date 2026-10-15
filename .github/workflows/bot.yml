@@ -1,9 +1,11 @@
+
 name: Telegram TTS Bot
 
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
   schedule:
     - cron: "17 */5 * * *"
 
@@ -29,19 +31,19 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install Docker and FFmpeg
+      - name: Install system dependencies
         run: |
           set -e
           sudo apt-get update
           sudo apt-get install -y ffmpeg curl
-          docker --version
+          python --version
           ffmpeg -version
 
       - name: Prepare Local Bot API directories
         run: |
           set -e
-          sudo mkdir -p /var/lib/telegram-bot-api /tmp/telegram-bot-api
-          sudo chmod 777 /var/lib/telegram-bot-api /tmp/telegram-bot-api
+          sudo mkdir -p /var/lib/telegram-bot-api
+          sudo chmod 777 /var/lib/telegram-bot-api
 
       - name: Start Telegram Local Bot API
         env:
@@ -50,12 +52,25 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
           set -euo pipefail
-          test -n "$API_ID" || { echo "::error::Missing API_ID secret"; exit 1; }
-          test -n "$API_HASH" || { echo "::error::Missing API_HASH secret"; exit 1; }
-          test -n "$BOT_TOKEN" || { echo "::error::Missing BOT_TOKEN secret"; exit 1; }
+
+          test -n "$API_ID" || {
+            echo "::error::Missing API_ID secret"
+            exit 1
+          }
+
+          test -n "$API_HASH" || {
+            echo "::error::Missing API_HASH secret"
+            exit 1
+          }
+
+          test -n "$BOT_TOKEN" || {
+            echo "::error::Missing BOT_TOKEN secret"
+            exit 1
+          }
 
           docker pull aiogram/telegram-bot-api:latest
           docker rm -f telegram-bot-api 2>/dev/null || true
+
           docker run -d \
             --name telegram-bot-api \
             --restart=no \
@@ -64,14 +79,15 @@ jobs:
             -e TELEGRAM_API_HASH="$API_HASH" \
             -e TELEGRAM_LOCAL=1 \
             --mount type=bind,source=/var/lib/telegram-bot-api,target=/var/lib/telegram-bot-api \
-            --mount type=bind,source=/tmp,target=/tmp \
             aiogram/telegram-bot-api:latest
 
           READY=0
+
           for i in $(seq 1 45); do
             RUNNING="$(docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null || echo false)"
+
             if [ "$RUNNING" != "true" ]; then
-              echo "::error::Local Bot API container stopped unexpectedly."
+              echo "::error::Local Bot API container stopped"
               docker logs --tail 100 telegram-bot-api || true
               exit 1
             fi
@@ -79,11 +95,12 @@ jobs:
             CODE="$(curl -sS --max-time 5 \
               -o "$RUNNER_TEMP/getme.json" \
               -w '%{http_code}' \
-              -X POST "http://127.0.0.1:8081/bot${BOT_TOKEN}/getMe" || true)"
+              -X POST \
+              "http://127.0.0.1:8081/bot${BOT_TOKEN}/getMe" || true)"
 
             if [ "$CODE" = "200" ] && grep -q '"ok":true' "$RUNNER_TEMP/getme.json"; then
               READY=1
-              echo "Local Bot API is ready."
+              echo "Local Bot API is ready"
               break
             fi
 
@@ -91,7 +108,7 @@ jobs:
           done
 
           if [ "$READY" -ne 1 ]; then
-            echo "::error::Local Bot API readiness check failed."
+            echo "::error::Local Bot API readiness check failed"
             docker logs --tail 100 telegram-bot-api || true
             exit 1
           fi
@@ -102,33 +119,41 @@ jobs:
           python -m pip install --upgrade pip
           pip install \
             python-telegram-bot==21.10 \
-            edge-tts gTTS pypdf python-docx \
-            EbookLib beautifulsoup4
+            edge-tts \
+            gTTS \
+            requests \
+            pypdf \
+            python-docx \
+            EbookLib \
+            beautifulsoup4
+
           python -m py_compile bot.py
 
-      - name: Run bot
+      - name: Run Telegram TTS bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
 
-          # Keep the original proxy secrets.
+          # Preserve existing single-proxy secrets
           PROXY_HOST: ${{ secrets.PROXY_HOST }}
           PROXY_PORT: ${{ secrets.PROXY_PORT }}
           PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
           PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
 
-          # Optional proxy pool. Only used if PROXY_LIST exists as a secret.
+          # Optional list of proxies, one URL per line
           PROXY_LIST: ${{ secrets.PROXY_LIST }}
 
           LOCAL_BOT_API: "1"
           LOCAL_BOT_API_URL: "http://127.0.0.1:8081"
+
           MAX_UPLOAD_MB: "1900"
           MAX_INPUT_MB: "1900"
           SEND_PART_MB: "1800"
           MAX_TEXT_CHARS: "20000000"
           TTS_CONCURRENCY: "3"
           PYTHONUNBUFFERED: "1"
+
         run: python -u bot.py
 
       - name: Show Local Bot API logs
@@ -141,5 +166,6 @@ jobs:
         run: |
           rm -f "$RUNNER_TEMP/getme.json"
           docker rm -f telegram-bot-api || true
-          sudo rm -rf /var/lib/telegram-bot-api /tmp/telegram-bot-api /tmp/telegram-tts-work
-          echo "Cleanup completed."
+          sudo rm -rf /var/lib/telegram-bot-api
+          sudo rm -rf /tmp/telegram-tts-work
+          echo "Cleanup completed"
