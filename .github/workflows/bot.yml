@@ -1,3 +1,4 @@
+
 name: Telegram TTS Bot
 
 on:
@@ -81,7 +82,7 @@ jobs:
           docker logs telegram-bot-api
           exit 1
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install \
@@ -109,10 +110,13 @@ jobs:
 
       - name: Show Local Bot API logs
         if: always()
-        run: docker logs telegram-bot-api || true
+        run: |
+          docker logs telegram-bot-api || true
 
       - name: Stop Local Bot API and clear server data
         if: always()
         run: |
           docker rm -f telegram-bot-api || true
-          rm -rf "$RUNNER_TEMP/tg-api-data"
+          sudo rm -rf "$RUNNER_TEMP/tg-api-data"
+          rm -rf /tmp/telegram-tts-work || true
+          echo "Cleanup completed"
