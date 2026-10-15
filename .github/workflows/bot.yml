@@ -36,6 +36,13 @@ jobs:
           sudo apt-get install -y ffmpeg curl
           docker --version
 
+      - name: Prepare shared Local Bot API directories
+        run: |
+          sudo mkdir -p /var/lib/telegram-bot-api
+          sudo chmod 777 /var/lib/telegram-bot-api
+          sudo mkdir -p /tmp/telegram-bot-api
+          sudo chmod 777 /tmp/telegram-bot-api
+
       - name: Start Telegram Local Bot API
         env:
           API_ID: ${{ secrets.API_ID }}
@@ -48,8 +55,6 @@ jobs:
           test -n "$API_HASH" || { echo "Missing API_HASH"; exit 1; }
           test -n "$BOT_TOKEN" || { echo "Missing BOT_TOKEN"; exit 1; }
 
-          mkdir -p "$RUNNER_TEMP/tg-api-data"
-
           docker pull aiogram/telegram-bot-api:latest
           docker rm -f telegram-bot-api 2>/dev/null || true
 
@@ -60,13 +65,11 @@ jobs:
             -e TELEGRAM_API_ID="$API_ID" \
             -e TELEGRAM_API_HASH="$API_HASH" \
             -e TELEGRAM_LOCAL=1 \
-            -v "$RUNNER_TEMP/tg-api-data:/var/lib/telegram-bot-api" \
-            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -v /var/lib/telegram-bot-api:/var/lib/telegram-bot-api \
             -v /tmp:/tmp \
             aiogram/telegram-bot-api:latest
 
           READY=0
-
           for i in $(seq 1 45); do
             if ! docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null | grep -q true; then
               echo "Container stopped unexpectedly."
@@ -83,7 +86,6 @@ jobs:
                 break
               fi
             fi
-
             sleep 2
           done
 
@@ -122,14 +124,14 @@ jobs:
 
       - name: Show Local Bot API logs
         if: always()
-        run: |
-          docker logs --tail 100 telegram-bot-api || true
+        run: docker logs --tail 100 telegram-bot-api || true
 
       - name: Stop Local Bot API and clear server data
         if: always()
         run: |
           docker rm -f telegram-bot-api || true
-          sudo rm -rf "$RUNNER_TEMP/tg-api-data"
-          rm -f "$RUNNER_TEMP/getme.json"
+          sudo rm -rf /var/lib/telegram-bot-api
+          sudo rm -rf /tmp/telegram-bot-api
           sudo rm -rf /tmp/telegram-tts-work
+          rm -f "$RUNNER_TEMP/getme.json"
           echo "Cleanup completed"
