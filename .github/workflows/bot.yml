@@ -18,6 +18,7 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -28,22 +29,90 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install FFmpeg
+      - name: Install Docker and FFmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg curl
+          docker --version
+
+      - name: Start Telegram Local Bot API
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+        run: |
+          set -euo pipefail
+
+          test -n "$API_ID" || {
+            echo "Missing API_ID secret"
+            exit 1
+          }
+
+          test -n "$API_HASH" || {
+            echo "Missing API_HASH secret"
+            exit 1
+          }
+
+          mkdir -p "$RUNNER_TEMP/tg-api-data"
+
+          docker pull aiogram/telegram-bot-api:latest
+
+          docker run -d \
+            --name telegram-bot-api \
+            --restart=no \
+            -p 127.0.0.1:8081:8081 \
+            -e TELEGRAM_API_ID="$API_ID" \
+            -e TELEGRAM_API_HASH="$API_HASH" \
+            -e TELEGRAM_LOCAL=1 \
+            -v "$RUNNER_TEMP/tg-api-data:/var/lib/telegram-bot-api" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -v /tmp:/tmp \
+            aiogram/telegram-bot-api:latest
+
+          for i in $(seq 1 30); do
+            if docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null | grep -q true; then
+              if curl -fsS http://127.0.0.1:8081/ >/dev/null 2>&1; then
+                echo "Local Bot API is responding"
+                exit 0
+              fi
+            fi
+            sleep 2
+          done
+
+          docker logs telegram-bot-api
+          exit 1
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install python-telegram-bot==21.10 edge-tts gTTS pypdf python-docx EbookLib beautifulsoup4
+          pip install \
+            python-telegram-bot==21.10 \
+            edge-tts gTTS pypdf python-docx \
+            EbookLib beautifulsoup4
 
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
           PROXY_HOST: ${{ secrets.PROXY_HOST }}
           PROXY_PORT: ${{ secrets.PROXY_PORT }}
           PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
           PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
+          LOCAL_BOT_API: "1"
+          LOCAL_BOT_API_URL: "http://127.0.0.1:8081"
+          MAX_UPLOAD_MB: "1900"
+          MAX_INPUT_MB: "1900"
+          SEND_PART_MB: "1800"
+          MAX_TEXT_CHARS: "20000000"
           PYTHONUNBUFFERED: "1"
         run: python -u bot.py
+
+      - name: Show Local Bot API logs
+        if: always()
+        run: docker logs telegram-bot-api || true
+
+      - name: Stop Local Bot API and clear server data
+        if: always()
+        run: |
+          docker rm -f telegram-bot-api || true
+          rm -rf "$RUNNER_TEMP/tg-api-data"
