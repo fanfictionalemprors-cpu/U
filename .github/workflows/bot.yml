@@ -3,8 +3,7 @@ name: Telegram TTS Bot
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
   schedule:
     - cron: "17 */5 * * *"
 
@@ -38,17 +37,11 @@ jobs:
           docker --version
           ffmpeg -version
 
-      - name: Prepare shared Local Bot API directories
+      - name: Prepare Local Bot API directories
         run: |
           set -e
-          sudo mkdir -p /var/lib/telegram-bot-api
-          sudo mkdir -p /tmp/telegram-bot-api
-          sudo chmod -R 777 /var/lib/telegram-bot-api
-          sudo chmod -R 777 /tmp/telegram-bot-api
-
-          echo "Runner directories:"
-          ls -ld /var/lib/telegram-bot-api
-          ls -ld /tmp/telegram-bot-api
+          sudo mkdir -p /var/lib/telegram-bot-api /tmp/telegram-bot-api
+          sudo chmod 777 /var/lib/telegram-bot-api /tmp/telegram-bot-api
 
       - name: Start Telegram Local Bot API
         env:
@@ -57,25 +50,12 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
           set -euo pipefail
-
-          test -n "$API_ID" || {
-            echo "::error::Missing API_ID secret"
-            exit 1
-          }
-
-          test -n "$API_HASH" || {
-            echo "::error::Missing API_HASH secret"
-            exit 1
-          }
-
-          test -n "$BOT_TOKEN" || {
-            echo "::error::Missing BOT_TOKEN secret"
-            exit 1
-          }
+          test -n "$API_ID" || { echo "::error::Missing API_ID secret"; exit 1; }
+          test -n "$API_HASH" || { echo "::error::Missing API_HASH secret"; exit 1; }
+          test -n "$BOT_TOKEN" || { echo "::error::Missing BOT_TOKEN secret"; exit 1; }
 
           docker pull aiogram/telegram-bot-api:latest
           docker rm -f telegram-bot-api 2>/dev/null || true
-
           docker run -d \
             --name telegram-bot-api \
             --restart=no \
@@ -88,120 +68,69 @@ jobs:
             aiogram/telegram-bot-api:latest
 
           READY=0
-
           for i in $(seq 1 45); do
-            RUNNING="$(docker inspect \
-              -f '{{.State.Running}}' telegram-bot-api 2>/dev/null || echo false)"
-
+            RUNNING="$(docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null || echo false)"
             if [ "$RUNNING" != "true" ]; then
-              echo "::error::Local Bot API container stopped."
+              echo "::error::Local Bot API container stopped unexpectedly."
               docker logs --tail 100 telegram-bot-api || true
               exit 1
             fi
 
-            HTTP_CODE="$(curl -sS \
-              --max-time 5 \
+            CODE="$(curl -sS --max-time 5 \
               -o "$RUNNER_TEMP/getme.json" \
               -w '%{http_code}' \
-              -X POST \
-              "http://127.0.0.1:8081/bot${BOT_TOKEN}/getMe" \
-              || true)"
-
-            if [ "$HTTP_CODE" = "200" ] &&
-               grep -q '"ok":true' "$RUNNER_TEMP/getme.json"; then
+              -X POST "http://127.0.0.1:8081/bot${BOT_TOKEN}/getMe" || true)"
+            if [ "$CODE" = "200" ] && grep -q '"ok":true' "$RUNNER_TEMP/getme.json"; then
               READY=1
               echo "Local Bot API is ready."
               break
             fi
-
             sleep 2
           done
 
           if [ "$READY" -ne 1 ]; then
             echo "::error::Local Bot API readiness check failed."
-            docker ps -a --filter name=telegram-bot-api
             docker logs --tail 100 telegram-bot-api || true
             exit 1
           fi
-
-      - name: Verify shared Bot API storage
-        run: |
-          set -e
-
-          echo "Runner storage:"
-          ls -ld /var/lib/telegram-bot-api /tmp
-
-          echo "Container storage:"
-          docker exec telegram-bot-api sh -c \
-            'ls -ld /var/lib/telegram-bot-api /tmp'
-
-          echo "Container mount details:"
-          docker inspect telegram-bot-api \
-            --format '{{json .Mounts}}'
 
       - name: Install Python dependencies
         run: |
           set -e
           python -m pip install --upgrade pip
-
           pip install \
             python-telegram-bot==21.10 \
-            edge-tts \
-            gTTS \
-            pypdf \
-            python-docx \
-            EbookLib \
-            beautifulsoup4
-
-          python -c \
-            "import telegram; print('python-telegram-bot:', telegram.__version__)"
+            edge-tts gTTS pypdf python-docx \
+            EbookLib beautifulsoup4
+          python -m py_compile bot.py
 
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
-
           PROXY_HOST: ${{ secrets.PROXY_HOST }}
           PROXY_PORT: ${{ secrets.PROXY_PORT }}
           PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
           PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
-
           LOCAL_BOT_API: "1"
           LOCAL_BOT_API_URL: "http://127.0.0.1:8081"
-
           MAX_UPLOAD_MB: "1900"
           MAX_INPUT_MB: "1900"
           SEND_PART_MB: "1800"
           MAX_TEXT_CHARS: "20000000"
-
           PYTHONUNBUFFERED: "1"
-
-        run: |
-          set -e
-          python -u bot.py
+        run: python -u bot.py
 
       - name: Show Local Bot API logs
         if: always()
         run: |
-          echo "Container status:"
-          docker ps -a --filter name=telegram-bot-api || true
+          docker logs --tail 120 telegram-bot-api || true
 
-          echo "Local Bot API logs:"
-          docker logs --tail 150 telegram-bot-api || true
-
-          echo "Runner storage after execution:"
-          ls -lah /var/lib/telegram-bot-api || true
-
-      - name: Stop Local Bot API and clear server data
+      - name: Cleanup
         if: always()
         run: |
-          docker rm -f telegram-bot-api || true
-
-          sudo rm -rf /var/lib/telegram-bot-api
-          sudo rm -rf /tmp/telegram-bot-api
-          sudo rm -rf /tmp/telegram-tts-work
-
           rm -f "$RUNNER_TEMP/getme.json"
-
+          docker rm -f telegram-bot-api || true
+          sudo rm -rf /var/lib/telegram-bot-api /tmp/telegram-bot-api /tmp/telegram-tts-work
           echo "Cleanup completed."
