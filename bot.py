@@ -1,783 +1,571 @@
-#!/usr/bin/env python3
-import asyncio
-import logging
+
 import os
 import re
-import shutil
-import tempfile
 import time
+import math
+import asyncio
+import logging
+import tempfile
+import subprocess
 from pathlib import Path
-from urllib.parse import quote
+from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
 
-import edge_tts
-import requests
-from gtts import gTTS
-from pypdf import PdfReader
-from docx import Document
-from ebooklib import epub, ITEM_DOCUMENT
-from bs4 import BeautifulSoup
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import TelegramError
+from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
+from edge_tts import Communicate
+from gtts import gTTS
+
+# Optional input format libraries
+try:
+    from docx import Document
+except ImportError:
+    Document = None
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+try:
+    from ebooklib import epub
+    from bs4 import BeautifulSoup
+except ImportError:
+    epub = None
+    BeautifulSoup = None
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+MAX_INPUT_MB = int(os.getenv("MAX_INPUT_MB", "100"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "49"))
+SEND_PART_MB = int(os.getenv("SEND_PART_MB", "45"))
+
+CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "2500"))
+TTS_CONCURRENCY = max(1, min(int(os.getenv("TTS_CONCURRENCY", "3")), 10))
+
+DEFAULT_RATE = os.getenv("DEFAULT_RATE", "+10%")
+DEFAULT_PITCH = os.getenv("DEFAULT_PITCH", "+0Hz")
+DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "edge").lower()
+
+WORK_DIR = Path(os.getenv("TTS_WORK_DIR", "tts_work"))
+WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("tts-bot")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-LOCAL_BOT_API = os.getenv("LOCAL_BOT_API", "0").lower() in {"1", "true", "yes"}
-LOCAL_BOT_API_URL = os.getenv("LOCAL_BOT_API_URL", "http://127.0.0.1:8081").rstrip("/")
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1900" if LOCAL_BOT_API else "50"))
-MAX_INPUT_MB = int(os.getenv("MAX_INPUT_MB", "1900" if LOCAL_BOT_API else "50"))
-SEND_PART_MB = int(os.getenv("SEND_PART_MB", "1800" if LOCAL_BOT_API else "45"))
-MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "20000000"))
-CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "2500"))
-TTS_CONCURRENCY = max(1, min(4, int(os.getenv("TTS_CONCURRENCY", "3"))))
-WORK_ROOT = Path(os.getenv("TTS_WORKDIR", "/tmp/telegram-tts-work"))
-WORK_ROOT.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# VOICES
+# ============================================================
 
 VOICES = {
-    "madhur": ("hi-IN-MadhurNeural", "Hindi Male — Madhur"),
-    "swara": ("hi-IN-SwaraNeural", "Hindi Female — Swara"),
-    "guy": ("en-US-GuyNeural", "English Male — Guy"),
-    "jenny": ("en-US-JennyNeural", "English Female — Jenny"),
+    "madhur": {
+        "name": "Hindi Male",
+        "voice": "hi-IN-MadhurNeural",
+        "lang": "hi",
+    },
+    "swara": {
+        "name": "Hindi Female",
+        "voice": "hi-IN-SwaraNeural",
+        "lang": "hi",
+    },
+    "guy": {
+        "name": "English Male",
+        "voice": "en-US-GuyNeural",
+        "lang": "en",
+    },
+    "jenny": {
+        "name": "English Female",
+        "voice": "en-US-JennyNeural",
+        "lang": "en",
+    },
 }
 
-SETTINGS = {}
-TASKS = {}
-PROGRESS = {}
 
+# ============================================================
+# PROXY SUPPORT
+# Supports PROXY_LIST, PROXY_1...PROXY_10, or individual
+# PROXY_1_HOST / PROXY_1_PORT / PROXY_1_USERNAME /
+# PROXY_1_PASSWORD variables.
+# ============================================================
 
-def cfg(uid):
-    return SETTINGS.setdefault(uid, {
-        "voice": os.getenv("DEFAULT_VOICE", "hi-IN-MadhurNeural"),
-        "rate": float(os.getenv("DEFAULT_RATE", "1.1")),
-        "pitch": int(os.getenv("DEFAULT_PITCH", "0")),
-        "engine": os.getenv("DEFAULT_ENGINE", "edge").lower(),
-        "name": "Audiobook",
-    })
+def load_proxies():
+    proxies = []
 
-
-def safe_name(value):
-    value = Path(value or "Audiobook").stem
-    value = re.sub(r"[^A-Za-z0-9 _().-]+", "", value)
-    value = re.sub(r"\s+", " ", value).strip(" ._-")
-    return (value or "Audiobook")[:100]
-
-
-def _normalise_proxy(value):
-    value = value.strip()
-    if not value:
-        return None
-    if "://" not in value:
-        value = "http://" + value
-    return value
-
-
-def get_proxies():
-    """Read a proxy pool or fall back to the original proxy secrets."""
-    raw = os.getenv("PROXY_LIST", os.getenv("PROXIES", ""))
-    proxies = [
-        _normalise_proxy(x)
-        for x in re.split(r"[\n,;]+", raw)
-        if x.strip()
-    ]
-    proxies = [x for x in proxies if x]
+    proxy_list = os.getenv("PROXY_LIST", "").strip()
+    if proxy_list:
+        for item in re.split(r"[\n,;]+", proxy_list):
+            item = item.strip()
+            if item:
+                proxies.append(item)
 
     for i in range(1, 11):
         direct = os.getenv(f"PROXY_{i}", "").strip()
         if direct:
-            proxies.append(_normalise_proxy(direct))
+            proxies.append(direct)
             continue
 
         host = os.getenv(f"PROXY_{i}_HOST", "").strip()
         port = os.getenv(f"PROXY_{i}_PORT", "").strip()
-        user = os.getenv(f"PROXY_{i}_USERNAME", "").strip()
+        username = os.getenv(f"PROXY_{i}_USERNAME", "").strip()
         password = os.getenv(f"PROXY_{i}_PASSWORD", "").strip()
 
         if host and port:
-            auth = (
-                f"{quote(user, safe='')}:{quote(password, safe='')}@"
-                if user and password else ""
+            if username:
+                proxies.append(
+                    f"http://{username}:{password}@{host}:{port}"
+                )
+            else:
+                proxies.append(f"http://{host}:{port}")
+
+    # Backwards compatibility with single-proxy secrets
+    host = os.getenv("PROXY_HOST", "").strip()
+    port = os.getenv("PROXY_PORT", "").strip()
+    username = os.getenv("PROXY_USERNAME", "").strip()
+    password = os.getenv("PROXY_PASSWORD", "").strip()
+
+    if host and port:
+        if username:
+            proxies.append(f"http://{username}:{password}@{host}:{port}")
+        else:
+            proxies.append(f"http://{host}:{port}")
+
+    # Remove duplicates while preserving order
+    return list(dict.fromkeys(proxies))[:10]
+
+
+PROXIES = load_proxies()
+
+
+def get_proxy(index):
+    if not PROXIES:
+        return None
+    return PROXIES[index % len(PROXIES)]
+
+
+# ============================================================
+# USER SETTINGS AND JOB STATUS
+# ============================================================
+
+USER_SETTINGS = {}
+USER_JOBS = {}
+USER_NAMES = {}
+JOB_LOCKS = {}
+
+
+def settings_for(user_id):
+    if user_id not in USER_SETTINGS:
+        USER_SETTINGS[user_id] = {
+            "voice": "madhur",
+            "engine": DEFAULT_ENGINE,
+            "rate": DEFAULT_RATE,
+            "pitch": DEFAULT_PITCH,
+        }
+    return USER_SETTINGS[user_id]
+
+
+def progress_bar(percent, width=16):
+    percent = max(0, min(100, int(percent)))
+    filled = int(width * percent / 100)
+    return "[" + ("█" * filled) + ("░" * (width - filled)) + "]"
+
+
+def format_time(seconds):
+    seconds = max(0, int(seconds))
+    return str(timedelta(seconds=seconds))
+
+
+def split_text(text, max_chars=CHUNK_CHARS):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    if not text:
+        return []
+
+    chunks = []
+    current = ""
+
+    # Prefer paragraph/sentence boundaries.
+    pieces = re.split(r"(\n\n+|(?<=[.!?।])\s+)", text)
+
+    for piece in pieces:
+        if not piece:
+            continue
+
+        if len(piece) > max_chars:
+            if current.strip():
+                chunks.append(current.strip())
+                current = ""
+
+            for start in range(0, len(piece), max_chars):
+                part = piece[start:start + max_chars].strip()
+                if part:
+                    chunks.append(part)
+            continue
+
+        if len(current) + len(piece) > max_chars:
+            if current.strip():
+                chunks.append(current.strip())
+            current = piece.strip()
+        else:
+            current += piece
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks
+
+
+# ============================================================
+# INPUT FILE EXTRACTION
+# ============================================================
+
+def extract_text(file_path):
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+
+    if suffix == ".txt":
+        for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+            try:
+                return path.read_text(encoding=encoding)
+            except UnicodeDecodeError:
+                continue
+        raise ValueError("Could not decode this TXT file.")
+
+    if suffix == ".docx":
+        if Document is None:
+            raise RuntimeError("Install python-docx to read DOCX files.")
+
+        doc = Document(str(path))
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+
+        for table in doc.tables:
+            for row in table.rows:
+                paragraphs.append(" | ".join(cell.text for cell in row.cells))
+
+        return "\n\n".join(paragraphs)
+
+    if suffix == ".pdf":
+        if PdfReader is None:
+            raise RuntimeError("Install pypdf to read PDF files.")
+
+        reader = PdfReader(str(path))
+        pages = []
+
+        for page in reader.pages:
+            pages.append(page.extract_text() or "")
+
+        return "\n\n".join(pages)
+
+    if suffix == ".epub":
+        if epub is None or BeautifulSoup is None:
+            raise RuntimeError(
+                "Install EbookLib and beautifulsoup4 to read EPUB files."
             )
-            proxies.append(f"http://{auth}{host}:{port}")
 
-    if not proxies:
-        host = os.getenv("PROXY_HOST", "").strip()
-        port = os.getenv("PROXY_PORT", "").strip()
-        user = os.getenv("PROXY_USERNAME", "").strip()
-        password = os.getenv("PROXY_PASSWORD", "").strip()
+        book = epub.read_epub(str(path))
+        sections = []
 
-        if host and port:
-            auth = (
-                f"{quote(user, safe='')}:{quote(password, safe='')}@"
-                if user and password else ""
-            )
-            proxies.append(f"http://{auth}{host}:{port}")
+        for item in book.get_items():
+            if item.get_type() == 9:  # EbookLib ITEM_DOCUMENT
+                soup = BeautifulSoup(item.get_content(), "html.parser")
+                for tag in soup(["script", "style"]):
+                    tag.decompose()
 
-    return list(dict.fromkeys(x for x in proxies if x))
+                content = soup.get_text("\n", strip=True)
+                if content:
+                    sections.append(content)
 
+        return "\n\n".join(sections)
 
-def get_proxy(index=0):
-    proxies = get_proxies()
-    return proxies[index % len(proxies)] if proxies else None
+    raise ValueError("Supported files: TXT, DOCX, PDF and EPUB.")
 
 
-def format_duration(seconds):
-    if seconds is None or seconds < 0:
-        return "calculating…"
+# ============================================================
+# AUDIO GENERATION
+# ============================================================
 
-    seconds = int(seconds)
-    hours, rem = divmod(seconds, 3600)
-    minutes, secs = divmod(rem, 60)
+async def make_edge(text, output_path, settings, proxy=None):
+    voice_key = settings.get("voice", "madhur")
+    voice = VOICES.get(voice_key, VOICES["madhur"])["voice"]
 
-    if hours:
-        return f"{hours}h {minutes}m"
-    if minutes:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"
+    communicate_args = {
+        "text": text,
+        "voice": voice,
+        "rate": settings.get("rate", DEFAULT_RATE),
+        "pitch": settings.get("pitch", DEFAULT_PITCH),
+    }
+
+    if proxy:
+        communicate_args["proxy"] = proxy
+
+    communicate = Communicate(**communicate_args)
+    await communicate.save(str(output_path))
+
+    if not Path(output_path).is_file() or Path(output_path).stat().st_size == 0:
+        raise RuntimeError("Edge TTS generated an empty file.")
 
 
-async def audio_duration(path):
-    """Return MP3 duration in seconds using ffprobe, or zero if unavailable."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+async def make_google(text, output_path, settings):
+    """
+    gTTS does not accept session= or proxies= in its constructor.
+    This function deliberately does not pass unsupported arguments.
+    """
+    voice_key = settings.get("voice", "madhur")
+    lang = VOICES.get(voice_key, VOICES["madhur"])["lang"]
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tts = gTTS(
+        text=text,
+        lang=lang,
+        slow=False,
+        timeout=(15, 60),
+    )
+
+    await asyncio.wait_for(
+        asyncio.to_thread(tts.save, str(output_path)),
+        timeout=180,
+    )
+
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError("Google TTS generated an empty file.")
+
+
+async def generate_chunk(index, text, output_path, settings, semaphore):
+    async with semaphore:
+        engine = settings.get("engine", "edge").lower()
+        last_error = None
+
+        for attempt in range(3):
+            try:
+                if engine == "google":
+                    await make_google(text, output_path, settings)
+                else:
+                    await make_edge(
+                        text,
+                        output_path,
+                        settings,
+                        proxy=get_proxy(index + attempt),
+                    )
+
+                return output_path
+
+            except Exception as exc:
+                last_error = exc
+                log.warning(
+                    "Chunk %s attempt %s failed: %s",
+                    index + 1,
+                    attempt + 1,
+                    exc,
+                )
+
+                # Try Google as fallback after Edge failures.
+                if engine != "google" and attempt == 1:
+                    try:
+                        await make_google(text, output_path, settings)
+                        return output_path
+                    except Exception as fallback_error:
+                        last_error = fallback_error
+                        log.warning("Google fallback failed: %s", fallback_error)
+
+                await asyncio.sleep(min(2 ** attempt, 8))
+
+        raise RuntimeError(
+            f"Chunk {index + 1} failed after retries: {last_error}"
         )
-        out, _ = await proc.communicate()
-        return max(0.0, float(out.decode().strip())) if proc.returncode == 0 else 0.0
-    except Exception:
+
+
+# ============================================================
+# FFMPEG HELPERS
+# ============================================================
+
+def run_command(args):
+    result = subprocess.run(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr[-1500:] or "Command failed."
+        )
+
+    return result
+
+
+def get_duration(file_path):
+    result = run_command([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(file_path),
+    ])
+
+    try:
+        return float(result.stdout.strip())
+    except (TypeError, ValueError):
         return 0.0
 
 
-def edge_rate(rate):
-    return f"{round((rate - 1.0) * 100):+d}%"
-
-
-def extract_text(path):
-    ext = path.suffix.lower()
-
-    if ext in {".txt", ".text", ".md"}:
-        return path.read_text(encoding="utf-8", errors="replace")
-
-    if ext == ".pdf":
-        reader = PdfReader(str(path))
-        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
-
-    if ext == ".docx":
-        doc = Document(str(path))
-        return "\n".join(p.text for p in doc.paragraphs)
-
-    if ext == ".epub":
-        book = epub.read_epub(str(path))
-        parts = []
-
-        for item in book.get_items():
-            if item.get_type() == ITEM_DOCUMENT:
-                soup = BeautifulSoup(item.get_content(), "html.parser")
-                parts.append(soup.get_text(" ", strip=True))
-
-        return "\n\n".join(parts)
-
-    raise ValueError("Supported formats: TXT, MD, PDF, DOCX, EPUB.")
-
-
-def split_text(text, limit=CHUNK_CHARS):
-    text = re.sub(r"\r\n?", "\n", text).strip()
-    chunks = []
-
-    while text:
-        if len(text) <= limit:
-            chunks.append(text)
-            break
-
-        cut = max(
-            text.rfind("\n", 0, limit),
-            text.rfind(". ", 0, limit),
-            text.rfind(" ", 0, limit),
-        )
-
-        if cut < limit // 2:
-            cut = limit
-
-        chunks.append(text[:cut].strip())
-        text = text[cut:].strip()
-
-    return [x for x in chunks if x]
-
-
-async def make_edge(text, path, s):
-    """Generate Edge TTS audio with retries and reject empty output."""
-    kwargs = {}
-    proxy = s.get("_proxy") or get_proxy()
-
-    if proxy:
-        kwargs["proxy"] = proxy
-
-    last_error = None
-
-    for attempt in range(1, 4):
-        path.unlink(missing_ok=True)
-
-        try:
-            tts = edge_tts.Communicate(
-                text=text,
-                voice=s["voice"],
-                rate=edge_rate(s["rate"]),
-                pitch=f"{s['pitch']:+d}Hz",
-                **kwargs,
-            )
-
-            await asyncio.wait_for(tts.save(str(path)), timeout=150)
-
-            if path.is_file() and path.stat().st_size > 0:
-                return
-
-            raise RuntimeError("Edge TTS returned an empty audio file.")
-
-        except Exception as exc:
-            last_error = exc
-            path.unlink(missing_ok=True)
-
-            log.warning(
-                "Edge TTS attempt %s/3 failed (%s): %s",
-                attempt,
-                type(exc).__name__,
-                str(exc)[:300],
-            )
-
-            if attempt < 3:
-                await asyncio.sleep(attempt * 2)
-
-    raise RuntimeError(
-        f"Edge TTS failed after 3 attempts: "
-        f"{type(last_error).__name__}: {last_error}"
-    )
-
-
-async def make_google(text, path, s):
-    """Generate Google TTS using requests.Session for proxy support.
-
-    gTTS does not accept a `proxies=` constructor argument.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.unlink(missing_ok=True)
-
-    proxy = s.get("_proxy") or get_proxy()
-    session = requests.Session()
-
-    if proxy:
-        session.proxies.update({
-            "http": proxy,
-            "https": proxy,
-        })
-
-    lang = "hi" if s.get("voice", "").startswith("hi-") else "en"
-
-    try:
-        tts = gTTS(
-            text=text,
-            lang=lang,
-            slow=False,
-            session=session,
-            timeout=30,
-        )
-
-        await asyncio.wait_for(
-            asyncio.to_thread(tts.save, str(path)),
-            timeout=180,
-        )
-
-        if not path.is_file() or path.stat().st_size == 0:
-            raise RuntimeError("Google TTS produced an empty audio file.")
-
-        # Google TTS has no native rate/pitch controls; use FFmpeg.
-        rate = float(s.get("rate", 1.0))
-        pitch = int(s.get("pitch", 0))
-
-        if rate != 1.0 or pitch != 0:
-            adjusted = path.with_name(path.stem + "_adjusted.mp3")
-            adjusted.unlink(missing_ok=True)
-            factor = 2 ** (pitch / 1200)
-
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-i", str(path),
-                "-filter:a",
-                f"asetrate=44100*{factor:.6f},aresample=44100,"
-                f"atempo={rate:.6f}",
-                "-y", str(adjusted),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            _, err = await proc.communicate()
-
-            if (
-                proc.returncode
-                or not adjusted.is_file()
-                or adjusted.stat().st_size == 0
-            ):
-                adjusted.unlink(missing_ok=True)
-                raise RuntimeError(
-                    "Google audio processing failed: "
-                    + err.decode(errors="replace")[-800:]
-                )
-
-            path.unlink(missing_ok=True)
-            adjusted.rename(path)
-
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
-
-    finally:
-        session.close()
-
-
-def progress_bar(done, total, width=16):
-    total = max(1, int(total))
-    done = max(0, min(int(done), total))
-    pct = int(done * 100 / total)
-    filled = int(width * done / total)
-
-    return f"[{'█' * filled}{'░' * (width - filled)}] {pct}% ({done:,}/{total:,})"
-
-
-async def generate_audio(text, folder, s, status, uid):
-    chunks = split_text(text)
-
-    if not chunks:
-        raise ValueError("No readable text found.")
-
-    total = len(chunks)
-    total_chars = sum(len(c) for c in chunks)
-    proxy_pool = get_proxies()
-    started = time.monotonic()
-
-    PROGRESS[uid] = {
-        "stage": "Generating",
-        "done": 0,
-        "total": total,
-        "audio_seconds": 0.0,
-        "estimated_audio_seconds": 0.0,
-        "elapsed_seconds": 0.0,
-        "estimated_remaining_seconds": None,
-        "file_bytes": 0,
-        "proxy_count": len(proxy_pool),
-    }
-
-    semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
-    update_lock = asyncio.Lock()
-    completed = 0
-    completed_chars = 0
-    audio_seconds = 0.0
-    file_bytes = 0
-    last_update_time = 0.0
-
-    pieces = [
-        folder / f"chunk_{i:06d}.mp3"
-        for i in range(1, total + 1)
-    ]
-
-    def status_text(stage="🎙️ Generating audiobook"):
-        p = PROGRESS.get(uid, {})
-        done = p.get("done", 0)
-        count = p.get("total", total)
-        elapsed = p.get("elapsed_seconds", time.monotonic() - started)
-        est_remaining = p.get("estimated_remaining_seconds")
-        estimated_audio = p.get("estimated_audio_seconds", 0.0)
-        actual_audio = p.get("audio_seconds", 0.0)
-        size_mb = p.get("file_bytes", 0) / (1024 * 1024)
-        proxy_count = p.get("proxy_count", 0)
-
-        return (
-            f"{stage}\n{progress_bar(done, count)}\n"
-            f"🎧 Estimated audio: {format_duration(estimated_audio)}\n"
-            f"🔊 Audio made: {format_duration(actual_audio)}\n"
-            f"⏳ Est. time left: {format_duration(est_remaining)}\n"
-            f"⌛ Used time: {format_duration(elapsed)}\n"
-            f"💾 File size: {size_mb:.1f} MB\n"
-            f"⚡ Parallel workers: {TTS_CONCURRENCY} | "
-            f"Proxies configured: {proxy_count}"
-        )
-
-    async def process_chunk(index, chunk):
-        nonlocal completed, completed_chars
-        nonlocal audio_seconds, file_bytes, last_update_time
-
-        out = pieces[index - 1]
-
-        async with semaphore:
-            chunk_settings = dict(s)
-            proxy = get_proxy(index - 1)
-
-            if proxy:
-                chunk_settings["_proxy"] = proxy
-
-            if s["engine"] == "google":
-                await make_google(chunk, out, chunk_settings)
-            else:
-                try:
-                    await make_edge(chunk, out, chunk_settings)
-                except Exception as edge_error:
-                    log.warning(
-                        "Edge TTS failed on chunk %s/%s; "
-                        "trying Google fallback: %s: %s",
-                        index,
-                        total,
-                        type(edge_error).__name__,
-                        str(edge_error)[:300],
-                    )
-
-                    out.unlink(missing_ok=True)
-                    google_settings = dict(chunk_settings)
-                    google_settings["engine"] = "google"
-                    await make_google(chunk, out, google_settings)
-
-            if not out.is_file() or out.stat().st_size == 0:
-                out.unlink(missing_ok=True)
-                raise RuntimeError(
-                    f"TTS engine produced an empty audio file for chunk {index}."
-                )
-
-            duration = await audio_duration(out)
-            size = out.stat().st_size
-
-        async with update_lock:
-            completed += 1
-            completed_chars += len(chunk)
-            audio_seconds += duration
-            file_bytes += size
-
-            elapsed = time.monotonic() - started
-
-            projected_total_audio = (
-                audio_seconds / completed_chars * total_chars
-                if completed_chars else 0.0
-            )
-
-            estimated_total_wall = (
-                elapsed / completed * total
-                if completed else 0.0
-            )
-
-            PROGRESS[uid] = {
-                "stage": "Generating",
-                "done": completed,
-                "total": total,
-                "audio_seconds": audio_seconds,
-                "estimated_audio_seconds": projected_total_audio,
-                "elapsed_seconds": elapsed,
-                "estimated_remaining_seconds": max(
-                    0.0, estimated_total_wall - elapsed
-                ),
-                "file_bytes": file_bytes,
-                "proxy_count": len(proxy_pool),
-            }
-
-            now = time.monotonic()
-
-            if now - last_update_time >= 2 or completed == total:
-                last_update_time = now
-
-                try:
-                    await status.edit_text(status_text())
-                except TelegramError:
-                    pass
-
-        return out
-
-    tasks = [
-        asyncio.create_task(process_chunk(i, chunk))
-        for i, chunk in enumerate(chunks, 1)
-    ]
-
-    try:
-        await asyncio.gather(*tasks)
-    except Exception:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-
-    concat = folder / "concat.txt"
-    concat.write_text(
-        "".join(f"file '{x.as_posix()}'\n" for x in pieces),
-        encoding="utf-8",
-    )
-
-    merged = folder / "merged.mp3"
-
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "concat", "-safe", "0",
-        "-i", str(concat),
-        "-c", "copy", "-y", str(merged),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    _, err = await proc.communicate()
-
-    if proc.returncode:
-        raise RuntimeError(
-            "FFmpeg merge failed: "
-            + err.decode(errors="replace")[-1000:]
-        )
-
-    final_duration = await audio_duration(merged)
-    final_size = merged.stat().st_size if merged.exists() else 0
-
-    PROGRESS[uid] = {
-        "stage": "Preparing audio",
-        "done": total,
-        "total": total,
-        "audio_seconds": final_duration or audio_seconds,
-        "estimated_audio_seconds": final_duration or audio_seconds,
-        "elapsed_seconds": time.monotonic() - started,
-        "estimated_remaining_seconds": 0.0,
-        "file_bytes": final_size,
-        "proxy_count": len(proxy_pool),
-    }
-
-    try:
-        await status.edit_text(status_text("🧩 Merging audiobook"))
-    except TelegramError:
-        pass
-
-    return merged
-
-
-async def split_audio(source, folder):
-    max_bytes = SEND_PART_MB * 1024 * 1024
-
-    if source.stat().st_size <= max_bytes:
-        return [source]
-
-    probe = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(source),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    out, _ = await probe.communicate()
-    duration = float(out.decode().strip() or "0")
-
-    if duration <= 0:
-        raise RuntimeError("Could not determine audio duration.")
-
-    segment = max(
-        20,
-        duration * max_bytes / source.stat().st_size * 0.80,
-    )
-
-    for _ in range(10):
-        for old in folder.glob("part_*.mp3"):
-            old.unlink(missing_ok=True)
-
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", str(source),
-            "-f", "segment",
-            "-segment_time", str(segment),
-            "-c", "copy",
-            "-reset_timestamps", "1",
-            "-y", str(folder / "part_%03d.mp3"),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        _, err = await proc.communicate()
-
-        if proc.returncode:
-            raise RuntimeError(
-                "Audio split failed: "
-                + err.decode(errors="replace")[-1000:]
-            )
-
-        parts = sorted(folder.glob("part_*.mp3"))
-
-        if parts and all(p.stat().st_size <= max_bytes for p in parts):
-            return parts
-
-        segment *= 0.65
-
-    raise RuntimeError(
-        "Could not split audio under SEND_PART_MB; lower the value."
-    )
-
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "🎧 TTS Bot ready!\n"
-        "Send TXT, MD, PDF, DOCX or EPUB.\n"
-        "Use /settings for voice, rate, pitch and filename."
-    )
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "/start — Start\n"
-        "/help — Help\n"
-        "/settings — Settings menu\n"
-        "/voice madhur|swara|guy|jenny — Voice\n"
-        "/rate 1.5 — Rate (1.0–2.0)\n"
-        "/speed 1.5 — Rate alias\n"
-        "/pitch 5 — Pitch (-20 to +20 Hz)\n"
-        "/engine edge|google — Engine\n"
-        "/name My Audiobook — Output filename\n"
-        "/demo — Voice demo\n"
-        "/status — Progress bar\n"
-        "/cancel — Cancel conversion"
-    )
-
-
-def settings_text(uid):
-    s = cfg(uid)
-    label = next(
-        (v[1] for v in VOICES.values() if v[0] == s["voice"]),
-        s["voice"],
-    )
-
-    return (
-        "⚙️ TTS Settings\n\n"
-        f"Voice: {label}\n"
-        f"Rate: {s['rate']:.2f}x\n"
-        f"Pitch: {s['pitch']:+d} Hz\n"
-        f"Engine: {s['engine']}\n"
-        f"Audio name: {s['name']}"
-    )
-
-
-def settings_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Voice", callback_data="menu:voice"),
-            InlineKeyboardButton("Rate", callback_data="menu:rate"),
-        ],
-        [
-            InlineKeyboardButton("Pitch", callback_data="menu:pitch"),
-            InlineKeyboardButton("Engine", callback_data="menu:engine"),
-        ],
-        [
-            InlineKeyboardButton("Audio name help", callback_data="menu:name"),
-            InlineKeyboardButton("Refresh", callback_data="menu:refresh"),
-        ],
+def merge_audio(audio_paths, output_path, work_dir):
+    if not audio_paths:
+        raise RuntimeError("No audio chunks were generated.")
+
+    list_file = Path(work_dir) / "concat_list.txt"
+
+    with list_file.open("w", encoding="utf-8") as file:
+        for audio_path in audio_paths:
+            safe_path = str(Path(audio_path).resolve()).replace("'", "'\\''")
+            file.write(f"file '{safe_path}'\n")
+
+    run_command([
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(list_file),
+        "-vn",
+        "-c:a", "libmp3lame",
+        "-b:a", "64k",
+        "-y",
+        str(output_path),
     ])
 
+    if not Path(output_path).is_file() or Path(output_path).stat().st_size == 0:
+        raise RuntimeError("Audio merge failed.")
 
-async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        settings_text(update.effective_user.id),
-        reply_markup=settings_keyboard(),
-    )
+    return output_path
 
 
-async def voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+def split_large_audio(audio_path, work_dir, max_bytes):
+    audio_path = Path(audio_path)
+    size = audio_path.stat().st_size
 
-    if context.args:
-        key = context.args[0].lower()
+    if size <= max_bytes:
+        return [audio_path]
 
-        if key not in VOICES:
-            await update.effective_message.reply_text(
-                "Use madhur, swara, guy or jenny."
+    duration = get_duration(audio_path)
+    if duration <= 0:
+        raise RuntimeError("Could not determine audio duration for splitting.")
+
+    # Estimate each part's duration from the file's average bitrate.
+    parts_needed = math.ceil(size / max_bytes)
+    part_duration = max(60, int(duration / parts_needed))
+
+    output_pattern = str(Path(work_dir) / "part_%03d.mp3")
+
+    run_command([
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(audio_path),
+        "-f", "segment",
+        "-segment_time", str(part_duration),
+        "-reset_timestamps", "1",
+        "-c:a", "libmp3lame",
+        "-b:a", "48k",
+        "-y",
+        output_pattern,
+    ])
+
+    parts = sorted(Path(work_dir).glob("part_*.mp3"))
+
+    if not parts:
+        raise RuntimeError("Could not split large audio file.")
+
+    # Verify every part fits within the requested size.
+    for part in parts:
+        if part.stat().st_size > max_bytes:
+            raise RuntimeError(
+                f"{part.name} exceeds the size limit. "
+                "Lower SEND_PART_MB and try again."
             )
-            return
 
-        cfg(uid)["voice"] = VOICES[key][0]
-        await update.effective_message.reply_text(
-            f"Voice set: {VOICES[key][1]}"
-        )
-        return
+    return parts
 
-    kb = [
-        [InlineKeyboardButton(label, callback_data=f"voice:{key}")]
-        for key, (_, label) in VOICES.items()
-    ]
+
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = (
+        "🎧 **Novel TTS Bot**\n\n"
+        "Send a TXT, DOCX, PDF or EPUB file to create an audiobook.\n\n"
+        "**Commands**\n"
+        "/voice — choose voice\n"
+        "/engine edge or /engine google — choose engine\n"
+        "/rate +10% — set speech rate for Edge TTS\n"
+        "/pitch +0Hz — set pitch for Edge TTS\n"
+        "/name My Audiobook — set output name\n"
+        "/status — check current job\n"
+        "/cancel — cancel current job\n\n"
+        "Available voices: madhur, swara, guy, jenny"
+    )
 
     await update.effective_message.reply_text(
-        "Choose voice:",
-        reply_markup=InlineKeyboardMarkup(kb),
+        message,
+        parse_mode="Markdown",
     )
 
 
-async def rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = cfg(update.effective_user.id)
+async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    settings = settings_for(user_id)
 
     if not context.args:
+        lines = ["Available voices:"]
+        for key, item in VOICES.items():
+            marker = " ✓" if settings["voice"] == key else ""
+            lines.append(f"{key} — {item['name']}{marker}")
+
+        await update.effective_message.reply_text("\n".join(lines))
+        return
+
+    choice = context.args[0].lower()
+
+    if choice not in VOICES:
         await update.effective_message.reply_text(
-            f"Current rate: {s['rate']:.2f}x. Use /rate 1.5 (1.0–2.0)."
+            "Invalid voice. Choose: madhur, swara, guy or jenny."
         )
         return
 
-    try:
-        value = float(context.args[0])
+    settings["voice"] = choice
 
-        if not 1.0 <= value <= 2.0:
-            raise ValueError
-    except ValueError:
-        await update.effective_message.reply_text(
-            "Rate must be 1.0–2.0, e.g. /rate 1.5"
-        )
-        return
-
-    s["rate"] = value
     await update.effective_message.reply_text(
-        f"Rate set to {value:.2f}x."
+        f"Voice set to {VOICES[choice]['name']}."
     )
 
 
-async def pitch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = cfg(update.effective_user.id)
+async def engine_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    settings = settings_for(user_id)
 
     if not context.args:
         await update.effective_message.reply_text(
-            f"Current pitch: {s['pitch']:+d} Hz. Use /pitch -5 (-20 to +20)."
-        )
-        return
-
-    try:
-        value = int(context.args[0])
-
-        if not -20 <= value <= 20:
-            raise ValueError
-    except ValueError:
-        await update.effective_message.reply_text(
-            "Pitch must be an integer from -20 to +20."
-        )
-        return
-
-    s["pitch"] = value
-    await update.effective_message.reply_text(
-        f"Pitch set to {value:+d} Hz."
-    )
-
-
-async def engine_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = cfg(update.effective_user.id)
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            f"Engine: {s['engine']}. Use /engine edge or /engine google."
+            f"Current engine: {settings['engine']}\n"
+            "Use /engine edge or /engine google."
         )
         return
 
@@ -785,509 +573,371 @@ async def engine_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if engine not in {"edge", "google"}:
         await update.effective_message.reply_text(
-            "Use /engine edge or /engine google."
+            "Choose edge or google."
         )
         return
 
-    s["engine"] = engine
+    settings["engine"] = engine
+
     await update.effective_message.reply_text(
-        f"Engine set to {engine}."
+        f"TTS engine set to {engine}."
     )
 
 
-async def name_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = cfg(update.effective_user.id)
+async def rate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    settings = settings_for(user_id)
 
     if not context.args:
         await update.effective_message.reply_text(
-            f"Current name: {s['name']}\nUse /name My Audiobook"
+            f"Current rate: {settings['rate']}\nExample: /rate +10%"
         )
         return
 
-    s["name"] = safe_name(" ".join(context.args))
-    await update.effective_message.reply_text(
-        f"Audio name set to {s['name']}.mp3"
-    )
-
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    task = TASKS.get(uid)
-    p = PROGRESS.get(uid)
-
-    if not task or task.done():
-        await update.effective_message.reply_text("No active conversion.")
-
-    elif p:
-        elapsed = p.get("elapsed_seconds", 0)
-
+    rate = context.args[0]
+    if not re.fullmatch(r"[+-]?\d{1,3}%", rate):
         await update.effective_message.reply_text(
-            f"{p['stage']}\n"
-            f"{progress_bar(p['done'], p['total'])}\n"
-            f"🎧 Estimated audio: "
-            f"{format_duration(p.get('estimated_audio_seconds', 0))}\n"
-            f"🔊 Audio made: "
-            f"{format_duration(p.get('audio_seconds', 0))}\n"
-            f"⏳ Est. time left: "
-            f"{format_duration(p.get('estimated_remaining_seconds'))}\n"
-            f"⌛ Used time: {format_duration(elapsed)}\n"
-            f"💾 File size: "
-            f"{p.get('file_bytes', 0) / (1024 * 1024):.1f} MB\n"
-            f"🌐 Proxies configured: "
-            f"{p.get('proxy_count', len(get_proxies()))}"
+            "Invalid rate. Example: /rate +10%"
         )
-
-    else:
-        await update.effective_message.reply_text("Conversion running.")
-
-
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task = TASKS.get(update.effective_user.id)
-
-    if not task or task.done():
-        await update.effective_message.reply_text("No active conversion.")
         return
 
-    task.cancel()
-    await update.effective_message.reply_text(
-        "Cancellation requested; temporary files will be cleared."
-    )
+    settings["rate"] = rate
+    await update.effective_message.reply_text(f"Rate set to {rate}.")
 
 
-async def demo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    folder = Path(tempfile.mkdtemp(prefix="tts-demo-", dir=WORK_ROOT))
+async def pitch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    settings = settings_for(user_id)
 
-    try:
-        s = cfg(uid).copy()
-        output = folder / f"{safe_name(s['name'])}_demo.mp3"
-
-        if s["engine"] == "google":
-            await make_google(
-                "Hello! नमस्ते! This is a voice demo.",
-                output,
-                s,
-            )
-        else:
-            await make_edge(
-                "Hello! नमस्ते! This is a voice demo.",
-                output,
-                s,
-            )
-
-        with output.open("rb") as audio:
-            await update.effective_message.reply_audio(
-                audio=audio,
-                filename=output.name,
-                title=output.stem[:64],
-            )
-
-    except Exception as exc:
-        log.exception("Demo failed")
+    if not context.args:
         await update.effective_message.reply_text(
-            f"Demo failed: {type(exc).__name__}: {str(exc)[:700]}"
+            f"Current pitch: {settings['pitch']}\nExample: /pitch +0Hz"
         )
-
-    finally:
-        shutil.rmtree(folder, ignore_errors=True)
-
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    uid = q.from_user.id
-    s = cfg(uid)
-    data = q.data
-
-    if data == "menu:refresh":
-        await q.edit_message_text(
-            settings_text(uid),
-            reply_markup=settings_keyboard(),
-        )
-
-    elif data == "menu:voice":
-        kb = [
-            [InlineKeyboardButton(label, callback_data=f"voice:{key}")]
-            for key, (_, label) in VOICES.items()
-        ]
-        await q.edit_message_text(
-            "Choose voice:",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-
-    elif data == "menu:rate":
-        kb = [
-            [
-                InlineKeyboardButton(
-                    f"{v:.1f}x",
-                    callback_data=f"rate:{v:.1f}",
-                )
-                for v in (1.0, 1.1, 1.2)
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{v:.1f}x",
-                    callback_data=f"rate:{v:.1f}",
-                )
-                for v in (1.3, 1.5, 1.7)
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{v:.1f}x",
-                    callback_data=f"rate:{v:.1f}",
-                )
-                for v in (1.8, 1.9, 2.0)
-            ],
-        ]
-
-        await q.edit_message_text(
-            "Choose rate:",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-
-    elif data == "menu:pitch":
-        kb = [
-            [
-                InlineKeyboardButton(
-                    f"{v:+d} Hz",
-                    callback_data=f"pitch:{v}",
-                )
-                for v in (-20, -10, -5, 0)
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{v:+d} Hz",
-                    callback_data=f"pitch:{v}",
-                )
-                for v in (5, 10, 15, 20)
-            ],
-        ]
-
-        await q.edit_message_text(
-            "Choose pitch:",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-
-    elif data == "menu:engine":
-        kb = [
-            [InlineKeyboardButton("Edge TTS", callback_data="engine:edge")],
-            [InlineKeyboardButton("Google TTS", callback_data="engine:google")],
-        ]
-
-        await q.edit_message_text(
-            "Choose engine:",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-
-    elif data == "menu:name":
-        await q.edit_message_text(
-            "Set the filename in chat using:\n/name My Audiobook"
-        )
-
-    elif data.startswith("voice:"):
-        key = data.split(":", 1)[1]
-
-        if key in VOICES:
-            s["voice"] = VOICES[key][0]
-            await q.edit_message_text(
-                f"Voice set: {VOICES[key][1]}"
-            )
-
-    elif data.startswith("rate:"):
-        s["rate"] = float(data.split(":", 1)[1])
-        await q.edit_message_text(
-            f"Rate set to {s['rate']:.1f}x"
-        )
-
-    elif data.startswith("pitch:"):
-        s["pitch"] = int(data.split(":", 1)[1])
-        await q.edit_message_text(
-            f"Pitch set to {s['pitch']:+d} Hz"
-        )
-
-    elif data.startswith("engine:"):
-        s["engine"] = data.split(":", 1)[1]
-        await q.edit_message_text(
-            f"Engine set to {s['engine']}"
-        )
-
-
-async def download_input_file(context, file_id, input_path):
-    """Download files safely when using the Local Bot API."""
-    from urllib.parse import urlsplit, unquote
-
-    tg_file = await context.bot.get_file(file_id)
-    returned_path = str(tg_file.file_path or "")
-    destination = Path(input_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    if not LOCAL_BOT_API:
-        await tg_file.download_to_drive(custom_path=str(destination))
         return
 
-    if not returned_path:
-        raise FileNotFoundError(
-            "Local Bot API getFile returned an empty file path."
+    pitch = context.args[0]
+    if not re.fullmatch(r"[+-]?\d{1,4}Hz", pitch):
+        await update.effective_message.reply_text(
+            "Invalid pitch. Example: /pitch +0Hz"
         )
+        return
 
-    source_path = None
+    settings["pitch"] = pitch
+    await update.effective_message.reply_text(f"Pitch set to {pitch}.")
 
-    if os.path.isabs(returned_path):
-        source_path = Path(returned_path)
-    else:
-        parsed = urlsplit(returned_path)
 
-        if parsed.scheme in {"http", "https"} and parsed.netloc:
-            url_path = unquote(parsed.path)
-            marker = "/file/bot"
-            marker_pos = url_path.find(marker)
+async def name_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
 
-            if marker_pos >= 0:
-                after_marker = url_path[marker_pos + len(marker):]
-                slash_pos = after_marker.find("/")
-
-                if slash_pos >= 0:
-                    raw_server_path = after_marker[slash_pos:].lstrip("/")
-
-                    if raw_server_path:
-                        source_path = Path("/" + raw_server_path)
-
-    if source_path is None or not source_path.is_absolute():
-        raise ValueError(
-            "Could not extract the Local Bot API server file path from getFile."
+    if not context.args:
+        current = USER_NAMES.get(user_id, "Audiobook")
+        await update.effective_message.reply_text(
+            f"Current output name: {current}\n"
+            "Use /name My Audiobook"
         )
+        return
 
-    proc = await asyncio.create_subprocess_exec(
-        "docker", "cp",
-        f"telegram-bot-api:{source_path}",
-        str(destination),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    name = " ".join(context.args).strip()
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name)[:100].strip(" .")
+
+    if not name:
+        name = "Audiobook"
+
+    USER_NAMES[user_id] = name
+    await update.effective_message.reply_text(
+        f"Output name set to: {name}"
     )
 
-    _, err = await proc.communicate()
 
-    if proc.returncode != 0 or not destination.is_file():
-        detail = err.decode("utf-8", errors="replace")[-700:]
-        detail = detail.replace(str(source_path), "<redacted-server-path>")
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    job = USER_JOBS.get(user_id)
 
-        raise FileNotFoundError(
-            "Could not copy the downloaded file from the Local Bot API container. "
-            "Confirm the container is running and the file path exists. "
-            f"docker cp error: {detail}"
-        )
+    if not job:
+        await update.effective_message.reply_text("No active audiobook job.")
+        return
 
-    log.info("Input file copied from Local Bot API container.")
+    await update.effective_message.reply_text(
+        job.get("status_text", "Job is running.")
+    )
 
 
-async def convert_document(update, context, filename):
-    message = update.effective_message
-    uid = update.effective_user.id
-    folder = Path(tempfile.mkdtemp(prefix=f"user-{uid}-", dir=WORK_ROOT))
-    status = await message.reply_text("📥 Downloading file…")
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    job = USER_JOBS.get(user_id)
 
-    try:
-        input_path = folder / Path(filename).name
+    if not job:
+        await update.effective_message.reply_text("No active job to cancel.")
+        return
 
-        await download_input_file(
-            context,
-            message.document.file_id,
-            input_path,
-        )
+    task = job.get("task")
+    if task and not task.done():
+        task.cancel()
+        await update.effective_message.reply_text("Cancellation requested.")
+    else:
+        await update.effective_message.reply_text("No running task found.")
 
-        await status.edit_text(
-            "📖 Extracting text…\n"
-            "Audio/time estimates will appear after the first chunks are generated."
-        )
 
-        text = extract_text(input_path)
-
-        if not text.strip():
-            raise ValueError(
-                "No readable text found; scanned PDFs need OCR."
-            )
-
-        if len(text) > MAX_TEXT_CHARS:
-            raise ValueError(
-                f"Text exceeds {MAX_TEXT_CHARS:,} characters."
-            )
-
-        s = cfg(uid).copy()
-        merged = await generate_audio(text, folder, s, status, uid)
-
-        await status.edit_text("✂️ Preparing audio parts…")
-        parts = await split_audio(merged, folder)
-
-        base = safe_name(
-            s["name"]
-            if s["name"] != "Audiobook"
-            else Path(filename).stem
-        )
-
-        PROGRESS[uid] = {
-            "stage": "Sending",
-            "done": 0,
-            "total": len(parts),
-        }
-
-        for i, part in enumerate(parts, 1):
-            if part.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
-                raise RuntimeError(
-                    "Part exceeds MAX_UPLOAD_MB; lower SEND_PART_MB."
-                )
-
-            outname = (
-                f"{base}.mp3"
-                if len(parts) == 1
-                else f"{base}_part_{i:03d}.mp3"
-            )
-
-            await status.edit_text(
-                f"📤 Sending audio {i}/{len(parts)}…"
-            )
-
-            with part.open("rb") as audio:
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=audio,
-                    filename=outname,
-                    title=Path(outname).stem[:64],
-                    read_timeout=600,
-                    write_timeout=600,
-                    connect_timeout=60,
-                    pool_timeout=60,
-                )
-
-            if part != merged:
-                part.unlink(missing_ok=True)
-
-            PROGRESS[uid] = {
-                "stage": "Sending",
-                "done": i,
-                "total": len(parts),
-            }
-
-        await status.edit_text(
-            f"✅ Complete! Sent {len(parts)} audio file(s). "
-            "Temporary files cleared."
-        )
-
-    except asyncio.CancelledError:
-        try:
-            await status.edit_text(
-                "⛔ Conversion cancelled; clearing temporary files."
-            )
-        except TelegramError:
-            pass
-        raise
-
-    except Exception as exc:
-        log.exception("Conversion failed")
-        error_text = (
-            f"❌ Conversion failed: {type(exc).__name__}: "
-            f"{str(exc)[:900]}"
-        )
-
-        try:
-            await status.edit_text(error_text)
-        except TelegramError:
-            await message.reply_text(error_text)
-
-    finally:
-        shutil.rmtree(folder, ignore_errors=True)
-        PROGRESS.pop(uid, None)
-
+# ============================================================
+# DOCUMENT HANDLER
+# ============================================================
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-    uid = update.effective_user.id
+    user = update.effective_user
+    user_id = str(user.id)
 
-    existing = TASKS.get(uid)
+    document = message.document
+    if not document:
+        return
 
-    if existing and not existing.done():
+    suffix = Path(document.file_name or "").suffix.lower()
+    if suffix not in {".txt", ".docx", ".pdf", ".epub"}:
         await message.reply_text(
-            "A conversion is already running. Use /cancel."
+            "Unsupported file. Send TXT, DOCX, PDF or EPUB."
         )
         return
 
-    filename = message.document.file_name or "input.txt"
-
-    if Path(filename).suffix.lower() not in {
-        ".txt", ".text", ".md", ".pdf", ".docx", ".epub"
-    }:
+    if document.file_size and document.file_size > MAX_INPUT_MB * 1024 * 1024:
         await message.reply_text(
-            "Supported: TXT, MD, PDF, DOCX, EPUB."
+            f"Input is too large. Limit: {MAX_INPUT_MB} MB."
         )
         return
 
-    if (
-        message.document.file_size
-        and message.document.file_size > MAX_INPUT_MB * 1024 * 1024
-    ):
-        await message.reply_text(
-            f"File exceeds configured {MAX_INPUT_MB} MB limit."
-        )
-        return
+    if user_id in USER_JOBS:
+        old_task = USER_JOBS[user_id].get("task")
+        if old_task and not old_task.done():
+            await message.reply_text(
+                "You already have a running job. Use /cancel first."
+            )
+            return
 
-    task = asyncio.create_task(
-        convert_document(update, context, filename)
-    )
-    TASKS[uid] = task
+    work_dir = Path(tempfile.mkdtemp(prefix="tts_", dir=WORK_DIR))
+    status_message = await message.reply_text("Downloading your file...")
 
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    finally:
-        if TASKS.get(uid) is task:
-            TASKS.pop(uid, None)
+    async def run_job():
+        start_time = time.monotonic()
+        settings = settings_for(user_id).copy()
+        input_path = work_dir / f"input{suffix}"
 
+        try:
+            tg_file = await document.get_file()
+            await tg_file.download_to_drive(custom_path=str(input_path))
+
+            if not input_path.is_file():
+                raise RuntimeError("Input download failed.")
+
+            text = await asyncio.to_thread(extract_text, input_path)
+            text = text.strip()
+
+            if not text:
+                raise RuntimeError(
+                    "No readable text found. Scanned PDFs may need OCR."
+                )
+
+            chunks = split_text(text)
+            if not chunks:
+                raise RuntimeError("No text chunks were produced.")
+
+            total = len(chunks)
+            semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
+            audio_paths = [
+                work_dir / f"chunk_{index:05d}.mp3"
+                for index in range(total)
+            ]
+
+            completed = 0
+            completed_chars = 0
+            total_chars = len(text)
+            last_update = 0.0
+
+            async def update_progress(index, chunk):
+                nonlocal completed, completed_chars, last_update
+
+                await generate_chunk(
+                    index,
+                    chunk,
+                    audio_paths[index],
+                    settings,
+                    semaphore,
+                )
+
+                completed += 1
+                completed_chars += len(chunk)
+
+                now = time.monotonic()
+                elapsed = now - start_time
+
+                percent = completed / total * 100
+                speed = completed_chars / max(elapsed, 1)
+                remaining_chars = max(0, total_chars - completed_chars)
+                eta = remaining_chars / max(speed, 1)
+
+                status_text = (
+                    f"🎙️ **Audio generation**\n\n"
+                    f"{progress_bar(percent)} {percent:.1f}%\n"
+                    f"Audio made: {completed}/{total} chunks\n"
+                    f"Estimated audio: {format_time(total_chars / 12)}\n"
+                    f"Est time remaining: {format_time(eta)}\n"
+                    f"Used time: {format_time(elapsed)}\n"
+                    f"File size: "
+                    f"{sum(p.stat().st_size for p in audio_paths if p.exists()) / 1048576:.1f} MB"
+                )
+
+                USER_JOBS[user_id]["status_text"] = status_text
+
+                if now - last_update >= 3 or completed == total:
+                    last_update = now
+                    try:
+                        await status_message.edit_text(
+                            status_text,
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+
+            # Run a limited number of chunk jobs concurrently.
+            tasks = [
+                asyncio.create_task(update_progress(i, chunk))
+                for i, chunk in enumerate(chunks)
+            ]
+
+            try:
+                await asyncio.gather(*tasks)
+            except Exception:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
+            output_name = USER_NAMES.get(user_id, Path(document.file_name).stem)
+            output_name = re.sub(r'[\\/:*?"<>|]+', "_", output_name).strip(" .")
+            if not output_name:
+                output_name = "Audiobook"
+
+            output_path = work_dir / f"{output_name}.mp3"
+
+            await status_message.edit_text(
+                "Merging audio chunks in the correct order..."
+            )
+
+            await asyncio.to_thread(
+                merge_audio,
+                audio_paths,
+                output_path,
+                work_dir,
+            )
+
+            max_bytes = min(SEND_PART_MB, MAX_UPLOAD_MB) * 1024 * 1024
+            parts = await asyncio.to_thread(
+                split_large_audio,
+                output_path,
+                work_dir,
+                max_bytes,
+            )
+
+            elapsed = time.monotonic() - start_time
+
+            for index, part in enumerate(parts, start=1):
+                caption = f"🎧 {output_name}"
+                if len(parts) > 1:
+                    caption += f" — Part {index}/{len(parts)}"
+
+                with part.open("rb") as audio_file:
+                    await message.reply_audio(
+                        audio=audio_file,
+                        filename=part.name,
+                        caption=caption,
+                        read_timeout=300,
+                        write_timeout=300,
+                        connect_timeout=60,
+                    )
+
+            await status_message.edit_text(
+                "✅ Audiobook completed!\n\n"
+                f"Chunks: {total}\n"
+                f"Parts sent: {len(parts)}\n"
+                f"Total time: {format_time(elapsed)}\n"
+                f"Final size: {output_path.stat().st_size / 1048576:.1f} MB"
+            )
+
+        except asyncio.CancelledError:
+            try:
+                await status_message.edit_text("⏹️ Job cancelled.")
+            except Exception:
+                pass
+            raise
+
+        except Exception as exc:
+            log.exception("Audiobook job failed")
+            try:
+                await status_message.edit_text(
+                    f"❌ Job failed:\n{str(exc)[:3000]}"
+                )
+            except Exception:
+                pass
+
+        finally:
+            USER_JOBS.pop(user_id, None)
+
+            # Clean temporary files after the job.
+            try:
+                import shutil
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    task = asyncio.create_task(run_job())
+
+    USER_JOBS[user_id] = {
+        "task": task,
+        "status_text": "Job started. Preparing input file...",
+    }
+
+
+# ============================================================
+# ERROR HANDLER AND MAIN
+# ============================================================
 
 async def error_handler(update, context):
-    log.error("Unhandled bot error", exc_info=context.error)
+    log.error(
+        "Telegram handler error",
+        exc_info=context.error,
+    )
 
 
 def main():
-    builder = Application.builder().token(BOT_TOKEN)
-
-    if LOCAL_BOT_API:
-        builder = (
-            builder
-            .base_url(f"{LOCAL_BOT_API_URL}/bot")
-            .base_file_url(f"{LOCAL_BOT_API_URL}/file/bot")
-            .local_mode(True)
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is missing. Add it to GitHub Actions Secrets."
         )
-        log.info("Using Local Bot API at %s", LOCAL_BOT_API_URL)
 
-    app = builder.build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("settings", settings_cmd))
-    app.add_handler(CommandHandler("voice", voice_cmd))
-    app.add_handler(CommandHandler("rate", rate_cmd))
-    app.add_handler(CommandHandler("speed", rate_cmd))
-    app.add_handler(CommandHandler("pitch", pitch_cmd))
-    app.add_handler(CommandHandler("engine", engine_cmd))
-    app.add_handler(CommandHandler("name", name_cmd))
-    app.add_handler(CommandHandler("demo", demo_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", start))
+    application.add_handler(CommandHandler("voice", voice_command))
+    application.add_handler(CommandHandler("engine", engine_command))
+    application.add_handler(CommandHandler("rate", rate_command))
+    application.add_handler(CommandHandler("pitch", pitch_command))
+    application.add_handler(CommandHandler("name", name_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
 
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(
+    application.add_handler(
         MessageHandler(filters.Document.ALL, document_handler)
     )
-    app.add_error_handler(error_handler)
+    application.add_error_handler(error_handler)
 
-    log.info(
-        "Bot starting; local API=%s; target part size=%s MB",
-        LOCAL_BOT_API,
-        SEND_PART_MB,
+    log.info("TTS bot starting.")
+    log.info("Loaded %s proxies.", len(PROXIES))
+    log.info("TTS concurrency: %s", TTS_CONCURRENCY)
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
     )
-
-    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
