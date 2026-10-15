@@ -480,13 +480,21 @@ async def download_input_file(context, file_id, input_path):
             "Local Bot API getFile result. Check the Local Bot API URL format."
         )
 
+    # Try the shared mount first. A file can appear to exist but still be
+    # unreadable by the runner due to container-created ownership/mode bits.
     if source_path.is_file():
-        shutil.copy2(source_path, destination)
-        log.info("Input copied from shared Local Bot API mount.")
-        return
+        try:
+            shutil.copy2(source_path, destination)
+            log.info("Input copied from shared Local Bot API mount.")
+            return
+        except (PermissionError, OSError) as exc:
+            log.warning(
+                "Shared-mount copy failed (%s); trying docker cp instead.",
+                type(exc).__name__,
+            )
 
-    # The file exists inside the Local Bot API container but may not be
-    # visible on the GitHub Actions runner. Copy it out using Docker.
+    # Copy through Docker so runner permissions on the bind-mounted file do
+    # not block the download. Never print source_path: it may contain token data.
     proc = await asyncio.create_subprocess_exec(
         "docker", "cp",
         f"telegram-bot-api:{source_path}",
@@ -498,9 +506,13 @@ async def download_input_file(context, file_id, input_path):
 
     if proc.returncode != 0 or not destination.is_file():
         detail = err.decode("utf-8", errors="replace")[-700:]
+        # Redact the server path because Local Bot API paths can include the
+        # bot token as a directory name.
+        detail = detail.replace(str(source_path), "<redacted-server-path>")
         raise FileNotFoundError(
             "Could not copy the Local Bot API file from its container. "
-            f"Container path: {source_path}. docker cp error: {detail}"
+            "Check that the container is running and the returned path exists. "
+            f"docker cp error: {detail}"
         )
 
     log.info("Input copied from Local Bot API Docker container.")
