@@ -119,15 +119,40 @@ def split_text(text, limit=CHUNK_CHARS):
 
 
 async def make_edge(text, path, s):
+    """Generate Edge TTS audio with retries and reject empty output."""
     kwargs = {}
     proxy = get_proxy()
     if proxy:
         kwargs["proxy"] = proxy
-    tts = edge_tts.Communicate(
-        text=text, voice=s["voice"], rate=edge_rate(s["rate"]),
-        pitch=f"{s['pitch']:+d}Hz", **kwargs
+
+    last_error = None
+    for attempt in range(1, 4):
+        path.unlink(missing_ok=True)
+        try:
+            tts = edge_tts.Communicate(
+                text=text,
+                voice=s["voice"],
+                rate=edge_rate(s["rate"]),
+                pitch=f"{s['pitch']:+d}Hz",
+                **kwargs,
+            )
+            await asyncio.wait_for(tts.save(str(path)), timeout=150)
+            if path.is_file() and path.stat().st_size > 0:
+                return
+            raise RuntimeError("Edge TTS returned an empty audio file.")
+        except Exception as exc:
+            last_error = exc
+            path.unlink(missing_ok=True)
+            log.warning(
+                "Edge TTS attempt %s/3 failed (%s): %s",
+                attempt, type(exc).__name__, str(exc)[:300],
+            )
+            if attempt < 3:
+                await asyncio.sleep(attempt * 2)
+
+    raise RuntimeError(
+        f"Edge TTS failed after 3 attempts: {type(last_error).__name__}: {last_error}"
     )
-    await tts.save(str(path))
 
 
 async def make_google(text, path, s):
@@ -164,7 +189,26 @@ async def generate_audio(text, folder, s, status, uid):
         if s["engine"] == "google":
             await make_google(chunk, out, s)
         else:
-            await make_edge(chunk, out, s)
+            try:
+                await make_edge(chunk, out, s)
+            except Exception as edge_error:
+                # Edge may intermittently return NoAudioReceived. Try Google
+                # automatically for this chunk instead of failing the whole book.
+                log.warning(
+                    "Edge TTS failed on chunk %s/%s; trying Google TTS fallback: %s: %s",
+                    i, len(chunks), type(edge_error).__name__, str(edge_error)[:300],
+                )
+                out.unlink(missing_ok=True)
+                await status.edit_text(
+                    f"⚠️ Edge TTS failed on chunk {i}/{len(chunks)}. Trying Google TTS fallback…"
+                )
+                google_settings = dict(s)
+                google_settings["engine"] = "google"
+                await make_google(chunk, out, google_settings)
+
+        if not out.is_file() or out.stat().st_size == 0:
+            out.unlink(missing_ok=True)
+            raise RuntimeError(f"TTS engine produced an empty audio file for chunk {i}.")
         pieces.append(out)
         PROGRESS[uid] = {"stage": "Generating", "done": i, "total": len(chunks)}
         if i == 1 or i % 5 == 0 or i == len(chunks):
