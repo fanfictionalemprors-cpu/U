@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import edge_tts
+import requests
 from gtts import gTTS
 from pypdf import PdfReader
 from docx import Document
@@ -80,7 +81,7 @@ def _normalise_proxy(value):
 
 
 def get_proxies():
-    """Read proxy pool, or fall back to the original proxy secrets."""
+    """Read a proxy pool or fall back to the original proxy secrets."""
     raw = os.getenv("PROXY_LIST", os.getenv("PROXIES", ""))
     proxies = [
         _normalise_proxy(x)
@@ -144,7 +145,7 @@ def format_duration(seconds):
 
 
 async def audio_duration(path):
-    """Return MP3 duration using ffprobe, or zero if unavailable."""
+    """Return MP3 duration in seconds using ffprobe, or zero if unavailable."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error",
@@ -251,7 +252,9 @@ async def make_edge(text, path, s):
 
             log.warning(
                 "Edge TTS attempt %s/3 failed (%s): %s",
-                attempt, type(exc).__name__, str(exc)[:300],
+                attempt,
+                type(exc).__name__,
+                str(exc)[:300],
             )
 
             if attempt < 3:
@@ -264,41 +267,84 @@ async def make_edge(text, path, s):
 
 
 async def make_google(text, path, s):
+    """Generate Google TTS using requests.Session for proxy support.
+
+    gTTS does not accept a `proxies=` constructor argument.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+
     proxy = s.get("_proxy") or get_proxy()
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    lang = "hi" if s["voice"].startswith("hi-") else "en"
+    session = requests.Session()
 
-    await asyncio.to_thread(
-        gTTS(text=text, lang=lang, slow=False, proxies=proxies).save,
-        str(path),
-    )
+    if proxy:
+        session.proxies.update({
+            "http": proxy,
+            "https": proxy,
+        })
 
-    # Google TTS has no native rate/pitch controls.
-    if s["rate"] != 1.0 or s["pitch"] != 0:
-        adjusted = path.with_name(path.stem + "_adjusted.mp3")
-        factor = 2 ** (s["pitch"] / 1200)
+    lang = "hi" if s.get("voice", "").startswith("hi-") else "en"
 
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", str(path),
-            "-filter:a",
-            f"asetrate=44100*{factor:.6f},aresample=44100,atempo={s['rate']:.6f}",
-            "-y", str(adjusted),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+    try:
+        tts = gTTS(
+            text=text,
+            lang=lang,
+            slow=False,
+            session=session,
+            timeout=30,
         )
 
-        _, err = await proc.communicate()
+        await asyncio.wait_for(
+            asyncio.to_thread(tts.save, str(path)),
+            timeout=180,
+        )
 
-        if proc.returncode:
+        if not path.is_file() or path.stat().st_size == 0:
+            raise RuntimeError("Google TTS produced an empty audio file.")
+
+        # Google TTS has no native rate/pitch controls; use FFmpeg.
+        rate = float(s.get("rate", 1.0))
+        pitch = int(s.get("pitch", 0))
+
+        if rate != 1.0 or pitch != 0:
+            adjusted = path.with_name(path.stem + "_adjusted.mp3")
             adjusted.unlink(missing_ok=True)
-            raise RuntimeError(
-                "Google audio processing failed: "
-                + err.decode(errors="replace")[-800:]
+            factor = 2 ** (pitch / 1200)
+
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-i", str(path),
+                "-filter:a",
+                f"asetrate=44100*{factor:.6f},aresample=44100,"
+                f"atempo={rate:.6f}",
+                "-y", str(adjusted),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
             )
 
+            _, err = await proc.communicate()
+
+            if (
+                proc.returncode
+                or not adjusted.is_file()
+                or adjusted.stat().st_size == 0
+            ):
+                adjusted.unlink(missing_ok=True)
+                raise RuntimeError(
+                    "Google audio processing failed: "
+                    + err.decode(errors="replace")[-800:]
+                )
+
+            path.unlink(missing_ok=True)
+            adjusted.rename(path)
+
+    except Exception:
         path.unlink(missing_ok=True)
-        adjusted.rename(path)
+        raise
+
+    finally:
+        session.close()
 
 
 def progress_bar(done, total, width=16):
@@ -369,13 +415,12 @@ async def generate_audio(text, folder, s, status, uid):
         )
 
     async def process_chunk(index, chunk):
-        nonlocal completed, completed_chars, audio_seconds
-        nonlocal file_bytes, last_update_time
+        nonlocal completed, completed_chars
+        nonlocal audio_seconds, file_bytes, last_update_time
 
         out = pieces[index - 1]
 
         async with semaphore:
-            # Different chunk indices rotate through the configured proxy pool.
             chunk_settings = dict(s)
             proxy = get_proxy(index - 1)
 
@@ -391,7 +436,9 @@ async def generate_audio(text, folder, s, status, uid):
                     log.warning(
                         "Edge TTS failed on chunk %s/%s; "
                         "trying Google fallback: %s: %s",
-                        index, total, type(edge_error).__name__,
+                        index,
+                        total,
+                        type(edge_error).__name__,
                         str(edge_error)[:300],
                     )
 
@@ -416,12 +463,15 @@ async def generate_audio(text, folder, s, status, uid):
             file_bytes += size
 
             elapsed = time.monotonic() - started
+
             projected_total_audio = (
                 audio_seconds / completed_chars * total_chars
                 if completed_chars else 0.0
             )
+
             estimated_total_wall = (
-                elapsed / completed * total if completed else 0.0
+                elapsed / completed * total
+                if completed else 0.0
             )
 
             PROGRESS[uid] = {
@@ -438,7 +488,6 @@ async def generate_audio(text, folder, s, status, uid):
                 "proxy_count": len(proxy_pool),
             }
 
-            # Avoid editing the Telegram status message too frequently.
             now = time.monotonic()
 
             if now - last_update_time >= 2 or completed == total:
@@ -487,7 +536,8 @@ async def generate_audio(text, folder, s, status, uid):
 
     if proc.returncode:
         raise RuntimeError(
-            "FFmpeg merge failed: " + err.decode(errors="replace")[-1000:]
+            "FFmpeg merge failed: "
+            + err.decode(errors="replace")[-1000:]
         )
 
     final_duration = await audio_duration(merged)
@@ -559,7 +609,8 @@ async def split_audio(source, folder):
 
         if proc.returncode:
             raise RuntimeError(
-                "Audio split failed: " + err.decode(errors="replace")[-1000:]
+                "Audio split failed: "
+                + err.decode(errors="replace")[-1000:]
             )
 
         parts = sorted(folder.glob("part_*.mp3"))
@@ -690,7 +741,9 @@ async def rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     s["rate"] = value
-    await update.effective_message.reply_text(f"Rate set to {value:.2f}x.")
+    await update.effective_message.reply_text(
+        f"Rate set to {value:.2f}x."
+    )
 
 
 async def pitch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -714,7 +767,9 @@ async def pitch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     s["pitch"] = value
-    await update.effective_message.reply_text(f"Pitch set to {value:+d} Hz.")
+    await update.effective_message.reply_text(
+        f"Pitch set to {value:+d} Hz."
+    )
 
 
 async def engine_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -735,7 +790,9 @@ async def engine_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     s["engine"] = engine
-    await update.effective_message.reply_text(f"Engine set to {engine}.")
+    await update.effective_message.reply_text(
+        f"Engine set to {engine}."
+    )
 
 
 async def name_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -806,9 +863,17 @@ async def demo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         output = folder / f"{safe_name(s['name'])}_demo.mp3"
 
         if s["engine"] == "google":
-            await make_google("Hello! नमस्ते! This is a voice demo.", output, s)
+            await make_google(
+                "Hello! नमस्ते! This is a voice demo.",
+                output,
+                s,
+            )
         else:
-            await make_edge("Hello! नमस्ते! This is a voice demo.", output, s)
+            await make_edge(
+                "Hello! नमस्ते! This is a voice demo.",
+                output,
+                s,
+            )
 
         with output.open("rb") as audio:
             await update.effective_message.reply_audio(
@@ -875,6 +940,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for v in (1.8, 1.9, 2.0)
             ],
         ]
+
         await q.edit_message_text(
             "Choose rate:",
             reply_markup=InlineKeyboardMarkup(kb),
@@ -897,6 +963,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for v in (5, 10, 15, 20)
             ],
         ]
+
         await q.edit_message_text(
             "Choose pitch:",
             reply_markup=InlineKeyboardMarkup(kb),
@@ -907,6 +974,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Edge TTS", callback_data="engine:edge")],
             [InlineKeyboardButton("Google TTS", callback_data="engine:google")],
         ]
+
         await q.edit_message_text(
             "Choose engine:",
             reply_markup=InlineKeyboardMarkup(kb),
@@ -922,23 +990,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if key in VOICES:
             s["voice"] = VOICES[key][0]
-            await q.edit_message_text(f"Voice set: {VOICES[key][1]}")
+            await q.edit_message_text(
+                f"Voice set: {VOICES[key][1]}"
+            )
 
     elif data.startswith("rate:"):
         s["rate"] = float(data.split(":", 1)[1])
-        await q.edit_message_text(f"Rate set to {s['rate']:.1f}x")
+        await q.edit_message_text(
+            f"Rate set to {s['rate']:.1f}x"
+        )
 
     elif data.startswith("pitch:"):
         s["pitch"] = int(data.split(":", 1)[1])
-        await q.edit_message_text(f"Pitch set to {s['pitch']:+d} Hz")
+        await q.edit_message_text(
+            f"Pitch set to {s['pitch']:+d} Hz"
+        )
 
     elif data.startswith("engine:"):
         s["engine"] = data.split(":", 1)[1]
-        await q.edit_message_text(f"Engine set to {s['engine']}")
+        await q.edit_message_text(
+            f"Engine set to {s['engine']}"
+        )
 
 
 async def download_input_file(context, file_id, input_path):
-    """Download an incoming document without malformed Local API URLs."""
+    """Download files safely when using the Local Bot API."""
     from urllib.parse import urlsplit, unquote
 
     tg_file = await context.bot.get_file(file_id)
@@ -959,7 +1035,6 @@ async def download_input_file(context, file_id, input_path):
 
     if os.path.isabs(returned_path):
         source_path = Path(returned_path)
-
     else:
         parsed = urlsplit(returned_path)
 
@@ -1014,6 +1089,7 @@ async def convert_document(update, context, filename):
 
     try:
         input_path = folder / Path(filename).name
+
         await download_input_file(
             context,
             message.document.file_id,
