@@ -40,22 +40,18 @@ jobs:
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
           set -euo pipefail
 
-          test -n "$API_ID" || {
-            echo "Missing API_ID secret"
-            exit 1
-          }
-
-          test -n "$API_HASH" || {
-            echo "Missing API_HASH secret"
-            exit 1
-          }
+          test -n "$API_ID" || { echo "Missing API_ID"; exit 1; }
+          test -n "$API_HASH" || { echo "Missing API_HASH"; exit 1; }
+          test -n "$BOT_TOKEN" || { echo "Missing BOT_TOKEN"; exit 1; }
 
           mkdir -p "$RUNNER_TEMP/tg-api-data"
 
           docker pull aiogram/telegram-bot-api:latest
+          docker rm -f telegram-bot-api 2>/dev/null || true
 
           docker run -d \
             --name telegram-bot-api \
@@ -69,18 +65,34 @@ jobs:
             -v /tmp:/tmp \
             aiogram/telegram-bot-api:latest
 
-          for i in $(seq 1 30); do
-            if docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null | grep -q true; then
-              if curl -fsS http://127.0.0.1:8081/ >/dev/null 2>&1; then
-                echo "Local Bot API is responding"
-                exit 0
+          READY=0
+
+          for i in $(seq 1 45); do
+            if ! docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null | grep -q true; then
+              echo "Container stopped unexpectedly."
+              break
+            fi
+
+            if curl -sS --max-time 4 \
+              -X POST \
+              "http://127.0.0.1:8081/bot${BOT_TOKEN}/getMe" \
+              -o "$RUNNER_TEMP/getme.json"; then
+              if grep -q '"ok":true' "$RUNNER_TEMP/getme.json"; then
+                READY=1
+                echo "Local Bot API is ready."
+                break
               fi
             fi
+
             sleep 2
           done
 
-          docker logs telegram-bot-api
-          exit 1
+          if [ "$READY" -ne 1 ]; then
+            echo "Local Bot API readiness check failed."
+            docker ps -a --filter name=telegram-bot-api
+            docker logs --tail 100 telegram-bot-api || true
+            exit 1
+          fi
 
       - name: Install Python dependencies
         run: |
@@ -111,12 +123,13 @@ jobs:
       - name: Show Local Bot API logs
         if: always()
         run: |
-          docker logs telegram-bot-api || true
+          docker logs --tail 100 telegram-bot-api || true
 
       - name: Stop Local Bot API and clear server data
         if: always()
         run: |
           docker rm -f telegram-bot-api || true
           sudo rm -rf "$RUNNER_TEMP/tg-api-data"
-          rm -rf /tmp/telegram-tts-work || true
+          rm -f "$RUNNER_TEMP/getme.json"
+          sudo rm -rf /tmp/telegram-tts-work
           echo "Cleanup completed"
