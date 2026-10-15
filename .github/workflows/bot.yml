@@ -80,11 +80,13 @@ jobs:
               -o "$RUNNER_TEMP/getme.json" \
               -w '%{http_code}' \
               -X POST "http://127.0.0.1:8081/bot${BOT_TOKEN}/getMe" || true)"
+
             if [ "$CODE" = "200" ] && grep -q '"ok":true' "$RUNNER_TEMP/getme.json"; then
               READY=1
               echo "Local Bot API is ready."
               break
             fi
+
             sleep 2
           done
 
@@ -109,16 +111,23 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
+
+          # Keep the original proxy secrets.
           PROXY_HOST: ${{ secrets.PROXY_HOST }}
           PROXY_PORT: ${{ secrets.PROXY_PORT }}
           PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
           PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
+
+          # Optional proxy pool. Only used if PROXY_LIST exists as a secret.
+          PROXY_LIST: ${{ secrets.PROXY_LIST }}
+
           LOCAL_BOT_API: "1"
           LOCAL_BOT_API_URL: "http://127.0.0.1:8081"
           MAX_UPLOAD_MB: "1900"
           MAX_INPUT_MB: "1900"
           SEND_PART_MB: "1800"
           MAX_TEXT_CHARS: "20000000"
+          TTS_CONCURRENCY: "3"
           PYTHONUNBUFFERED: "1"
         run: python -u bot.py
 
