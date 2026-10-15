@@ -422,16 +422,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def download_input_file(context, file_id, input_path):
-    """
-    Download a document correctly when using Telegram's Local Bot API.
+    """Download an incoming document without PTB's malformed Local API URL.
 
-    python-telegram-bot may expose file_path as either an absolute server
-    path or a URL such as:
-      http://127.0.0.1:8081/file/bot<TOKEN>//var/lib/.../file_0.txt
-
-    In local mode, extract the server path and copy it from the shared mount
-    or from the running Docker container. Avoid download_to_drive() here,
-    because it can request the malformed /file/bot<TOKEN>//var/lib/... URL.
+    In Local Bot API mode, get_file() may return a URL containing the server's
+    absolute path. Always use `docker cp` for that path instead of reading the
+    bind mount directly (which can fail with PermissionError) or calling
+    download_to_drive() (which may request /file/bot<TOKEN>//var/lib/...).
     """
     import asyncio
     from urllib.parse import urlsplit, unquote
@@ -446,17 +442,12 @@ async def download_input_file(context, file_id, input_path):
         return
 
     if not returned_path:
-        raise FileNotFoundError(
-            "Local Bot API getFile returned an empty file path."
-        )
+        raise FileNotFoundError("Local Bot API getFile returned an empty file path.")
 
     source_path = None
-
-    # Some PTB/Local Bot API combinations return the server path directly.
     if os.path.isabs(returned_path):
         source_path = Path(returned_path)
     else:
-        # Other combinations return the /file/bot<TOKEN>/<server-path> URL.
         parsed = urlsplit(returned_path)
         if parsed.scheme in {"http", "https"} and parsed.netloc:
             url_path = unquote(parsed.path)
@@ -466,35 +457,19 @@ async def download_input_file(context, file_id, input_path):
                 after_marker = url_path[marker_pos + len(marker):]
                 slash_pos = after_marker.find("/")
                 if slash_pos >= 0:
-                    # The token ends at the first slash. Local Bot API
-                    # commonly leaves a double slash before /var/lib/...
                     raw_server_path = after_marker[slash_pos:].lstrip("/")
                     if raw_server_path:
                         source_path = Path("/" + raw_server_path)
 
     if source_path is None or not source_path.is_absolute():
-        # Do not include the full returned URL in logs/errors because it
-        # contains the bot token.
+        # Never print returned_path: the URL contains the bot token.
         raise ValueError(
-            "Could not extract an absolute server file path from the "
-            "Local Bot API getFile result. Check the Local Bot API URL format."
+            "Could not extract the Local Bot API server file path from getFile."
         )
 
-    # Try the shared mount first. A file can appear to exist but still be
-    # unreadable by the runner due to container-created ownership/mode bits.
-    if source_path.is_file():
-        try:
-            shutil.copy2(source_path, destination)
-            log.info("Input copied from shared Local Bot API mount.")
-            return
-        except (PermissionError, OSError) as exc:
-            log.warning(
-                "Shared-mount copy failed (%s); trying docker cp instead.",
-                type(exc).__name__,
-            )
-
-    # Copy through Docker so runner permissions on the bind-mounted file do
-    # not block the download. Never print source_path: it may contain token data.
+    # Do not access source_path directly. The file may be owned by the
+    # container's user and unreadable to the GitHub runner. docker cp reads
+    # it through the Docker daemon and writes it to the runner's workspace.
     proc = await asyncio.create_subprocess_exec(
         "docker", "cp",
         f"telegram-bot-api:{source_path}",
@@ -506,16 +481,14 @@ async def download_input_file(context, file_id, input_path):
 
     if proc.returncode != 0 or not destination.is_file():
         detail = err.decode("utf-8", errors="replace")[-700:]
-        # Redact the server path because Local Bot API paths can include the
-        # bot token as a directory name.
         detail = detail.replace(str(source_path), "<redacted-server-path>")
         raise FileNotFoundError(
-            "Could not copy the Local Bot API file from its container. "
-            "Check that the container is running and the returned path exists. "
+            "Could not copy the downloaded file from the Local Bot API container. "
+            "Confirm the container is running and the file path exists. "
             f"docker cp error: {detail}"
         )
 
-    log.info("Input copied from Local Bot API Docker container.")
+    log.info("Input file copied from Local Bot API container.")
 
 
 async def convert_document(update, context, filename):
