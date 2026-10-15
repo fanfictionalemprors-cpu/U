@@ -5,7 +5,6 @@ on:
   push:
     branches: [main]
   schedule:
-    # Restart roughly every 5 hours. GitHub scheduled jobs may be delayed.
     - cron: "17 */5 * * *"
 
 permissions:
@@ -29,7 +28,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install FFmpeg (includes ffprobe)
+      - name: Install FFmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
@@ -42,5 +41,9 @@ jobs:
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          PROXY_HOST: ${{ secrets.PROXY_HOST }}
+          PROXY_PORT: ${{ secrets.PROXY_PORT }}
+          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
           PYTHONUNBUFFERED: "1"
         run: python -u bot.py
