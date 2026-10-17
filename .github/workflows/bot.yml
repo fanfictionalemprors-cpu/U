@@ -50,6 +50,7 @@ jobs:
             echo "Missing API_ID secret"
             exit 1
           }
+
           test -n "$TELEGRAM_API_HASH" || {
             echo "Missing API_HASH secret"
             exit 1
@@ -57,24 +58,25 @@ jobs:
 
           docker run -d \
             --name telegram-bot-api \
-            --restart unless-stopped \
             -p 127.0.0.1:8081:8081 \
             -e TELEGRAM_API_ID="$TELEGRAM_API_ID" \
             -e TELEGRAM_API_HASH="$TELEGRAM_API_HASH" \
             -e TELEGRAM_LOCAL=1 \
             --mount type=bind,source=/var/lib/telegram-bot-api,target=/var/lib/telegram-bot-api \
-            --mount type=bind,source=/tmp,target=/tmp \
             aiogram/telegram-bot-api:latest
 
+          echo "Waiting for Local Bot API startup..."
           for i in $(seq 1 30); do
-            if docker logs telegram-bot-api 2>&1 | grep -qi "start"; then
-              break
+            if ! docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null | grep -q true; then
+              echo "Local Bot API container stopped."
+              docker logs --tail 100 telegram-bot-api || true
+              exit 1
             fi
             sleep 2
           done
 
           docker ps --filter name=telegram-bot-api
-          docker logs --tail 40 telegram-bot-api
+          docker logs --tail 50 telegram-bot-api
 
       - name: Install Python dependencies
         run: |
@@ -89,14 +91,11 @@ jobs:
             beautifulsoup4
 
       - name: Check Python syntax
-        run: |
-          python -m py_compile bot.py
+        run: python -m py_compile bot.py
 
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
           LOCAL_BOT_API: "1"
           LOCAL_BOT_API_URL: "http://127.0.0.1:8081"
           DEFAULT_ENGINE: "edge"
@@ -114,6 +113,7 @@ jobs:
         if: always()
         run: |
           docker logs --tail 100 telegram-bot-api || true
+          df -h || true
 
       - name: Stop Local Bot API
         if: always()
