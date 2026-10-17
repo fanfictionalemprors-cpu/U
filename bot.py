@@ -483,8 +483,20 @@ async def download_input_file(context, file_id, input_path):
     if not basename or basename in {".", ".."}:
         raise RuntimeError("Local Bot API returned an invalid uploaded-file path.")
 
+    # Run the search as root and restrict it to likely file-storage locations.
+    # The Local Bot API container may not permit its default user to traverse
+    # /proc, /sys, or protected directories; those permission errors must not
+    # prevent locating the uploaded document in its data volume.
+    search_script = (
+        "for d in /var/lib/telegram-bot-api /documents /tmp; do "
+        "if [ -d \"$d\" ]; then "
+        "f=$(find \"$d\" -type f -name \"$1\" -print -quit 2>/dev/null); "
+        "if [ -n \"$f\" ]; then printf '%s\\n' \"$f\"; exit 0; fi; "
+        "fi; done; exit 1"
+    )
     found, find_err = await run_docker(
-        "exec", LOCAL_API_CONTAINER, "find", "/", "-type", "f", "-name", basename
+        "exec", "-u", "0", LOCAL_API_CONTAINER,
+        "sh", "-lc", search_script, "sh", basename
     )
     found_paths = []
     if found:
