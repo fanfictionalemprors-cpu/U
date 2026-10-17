@@ -82,10 +82,10 @@ jobs:
           sudo docker run -d \
             --name telegram-bot-api \
             -p 127.0.0.1:8081:8081 \
+            -e TELEGRAM_API_ID="${TELEGRAM_API_ID}" \
+            -e TELEGRAM_API_HASH="${TELEGRAM_API_HASH}" \
             -v telegram-bot-api-data:/var/lib/telegram-bot-api \
             aiogram/telegram-bot-api:latest \
-            --api-id="${TELEGRAM_API_ID}" \
-            --api-hash="${TELEGRAM_API_HASH}" \
             --local
 
           echo "Waiting for Local Bot API..."
