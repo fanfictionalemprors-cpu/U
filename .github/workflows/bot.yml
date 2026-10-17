@@ -4,8 +4,7 @@ name: Telegram TTS Bot
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
   schedule:
     - cron: "17 */5 * * *"
 
@@ -22,11 +21,9 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
@@ -34,14 +31,14 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg curl
+          sudo apt-get install -y ffmpeg
 
       - name: Prepare Local Bot API storage
         run: |
           sudo mkdir -p /var/lib/telegram-bot-api
           sudo chmod 777 /var/lib/telegram-bot-api
 
-      - name: Start Local Telegram Bot API
+      - name: Start Local Bot API
         env:
           TELEGRAM_API_ID: ${{ secrets.API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.API_HASH }}
@@ -64,7 +61,6 @@ jobs:
             --mount type=bind,source=/var/lib/telegram-bot-api,target=/var/lib/telegram-bot-api \
             aiogram/telegram-bot-api:latest
 
-          echo "Waiting for Local Bot API..."
           for i in $(seq 1 30); do
             if ! docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null | grep -q true; then
               docker logs --tail 100 telegram-bot-api || true
@@ -88,7 +84,7 @@ jobs:
             EbookLib \
             beautifulsoup4
 
-      - name: Check Python syntax
+      - name: Check syntax
         run: python -m py_compile bot.py
 
       - name: Run bot
@@ -108,7 +104,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: python -u bot.py
 
-      - name: Show Local Bot API logs
+      - name: Local Bot API logs
         if: always()
         run: |
           docker logs --tail 100 telegram-bot-api || true
