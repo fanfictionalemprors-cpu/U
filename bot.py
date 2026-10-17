@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import edge_tts
@@ -48,6 +49,35 @@ VOICES = {
 SETTINGS = {}
 TASKS = {}
 PROGRESS = {}
+
+def fmt_time(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}h {m:02d}m {sec:02d}s" if h else f"{m}m {sec:02d}s"
+
+def fmt_size(num_bytes):
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+
+def progress_bar(done, total, width=12):
+    total = max(1, total)
+    filled = min(width, int(width * done / total))
+    return "█" * filled + "░" * (width - filled)
+
+def progress_text(stage, done, total, started, extra=""):
+    elapsed = time.monotonic() - started
+    rate = done / elapsed if elapsed > 0 and done > 0 else 0
+    eta = (total - done) / rate if rate > 0 else 0
+    pct = min(100, int(100 * done / max(1, total)))
+    eta_text = fmt_time(eta) if done else "Calculating…"
+    lines = [f"{stage} {progress_bar(done, total)} {pct}%", f"Progress: {done:,}/{total:,}", f"⏱ Used time: {fmt_time(elapsed)}", f"⌛ Est. time left: {eta_text}"]
+    if extra:
+        lines.append(extra)
+    return "\n".join(lines)
 
 
 def cfg(uid):
@@ -108,11 +138,43 @@ def split_text(text, limit=CHUNK_CHARS):
 
 
 async def make_edge(text, path, s):
-    tts = edge_tts.Communicate(
-        text=text, voice=s["voice"], rate=edge_rate(s["rate"]),
-        pitch=f"{s['pitch']:+d}Hz"
+    """Retry transient Edge TTS failures and reject empty audio."""
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            path.unlink(missing_ok=True)
+            tts = edge_tts.Communicate(
+                text=text, voice=s["voice"], rate=edge_rate(s["rate"]),
+                pitch=f"{s['pitch']:+d}Hz"
+            )
+            await tts.save(str(path))
+            if path.is_file() and path.stat().st_size > 256:
+                return
+            raise RuntimeError("Edge TTS returned no audio or an empty audio file.")
+        except Exception as exc:
+            last_error = exc
+            path.unlink(missing_ok=True)
+            if attempt < 3:
+                await asyncio.sleep(attempt * 2)
+    raise RuntimeError(
+        f"Edge TTS failed after 3 attempts ({type(last_error).__name__}: {last_error}). "
+        "Try /engine google, or retry later if the TTS service is temporarily unavailable."
+    ) from last_error
+
+
+async def audio_metadata(path):
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration,size",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
-    await tts.save(str(path))
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError("Could not read audio metadata: " + err.decode(errors="replace")[-500:])
+    vals = out.decode(errors="replace").strip().splitlines()
+    duration = float(vals[0]) if vals else 0.0
+    size = int(vals[1]) if len(vals) > 1 and vals[1].isdigit() else path.stat().st_size
+    return duration, size
 
 
 async def make_google(text, path, s):
@@ -136,37 +198,67 @@ async def make_google(text, path, s):
         adjusted.rename(path)
 
 
-async def generate_audio(text, folder, s, status, uid):
+async def generate_audio(text, folder, s, status, uid, started):
     chunks = split_text(text)
     if not chunks:
         raise ValueError("No readable text found.")
     pieces = []
-    PROGRESS[uid] = {"stage": "Generating", "done": 0, "total": len(chunks)}
+    PROGRESS[uid] = {"stage": "Generating audio", "done": 0, "total": len(chunks), "started": started}
     for i, chunk in enumerate(chunks, 1):
         out = folder / f"chunk_{i:06d}.mp3"
         if s["engine"] == "google":
             await make_google(chunk, out, s)
         else:
-            await make_edge(chunk, out, s)
-        pieces.append(out)
-        PROGRESS[uid] = {"stage": "Generating", "done": i, "total": len(chunks)}
-        if i == 1 or i % 5 == 0 or i == len(chunks):
             try:
-                await status.edit_text(f"🎙️ Generating audio: {i}/{len(chunks)} chunks")
+                await make_edge(chunk, out, s)
+            except Exception as first_error:
+                if len(chunk) < 500:
+                    raise
+                log.warning("Edge TTS chunk %s failed; retrying in smaller pieces: %s", i, first_error)
+                mid = len(chunk) // 2
+                cut = chunk.rfind(" ", 0, mid)
+                if cut < len(chunk) // 4:
+                    cut = mid
+                subtexts = [chunk[:cut].strip(), chunk[cut:].strip()]
+                subpaths = []
+                for j, subtext in enumerate(subtexts, 1):
+                    subpath = folder / f"chunk_{i:06d}_sub_{j}.mp3"
+                    await make_edge(subtext, subpath, s)
+                    subpaths.append(subpath)
+                sublist = folder / f"subconcat_{i:06d}.txt"
+                sublist.write_text("".join(f"file '{x.as_posix()}'\n" for x in subpaths), encoding="utf-8")
+                proc_sub = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                    "-i", str(sublist), "-c", "copy", "-y", str(out),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+                )
+                _, suberr = await proc_sub.communicate()
+                if proc_sub.returncode or not out.is_file() or out.stat().st_size <= 256:
+                    raise RuntimeError("Edge TTS returned no audio even after splitting the failed chunk. " + suberr.decode(errors="replace")[-400:]) from first_error
+                for sp in subpaths:
+                    sp.unlink(missing_ok=True)
+                sublist.unlink(missing_ok=True)
+        if not out.is_file() or out.stat().st_size <= 256:
+            raise RuntimeError(f"TTS produced no audio for chunk {i}/{len(chunks)}.")
+        pieces.append(out)
+        PROGRESS[uid] = {"stage": "Generating audio", "done": i, "total": len(chunks), "started": started}
+        if i == 1 or i % 2 == 0 or i == len(chunks):
+            extra = f"🎧 Audio made: {i}/{len(chunks)} chunks"
+            try:
+                await status.edit_text(progress_text("🎙️ Generating", i, len(chunks), started, extra))
             except TelegramError:
                 pass
     concat = folder / "concat.txt"
     concat.write_text("".join(f"file '{x.as_posix()}'\n" for x in pieces), encoding="utf-8")
     merged = folder / "merged.mp3"
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "concat", "-safe", "0", "-i", str(concat),
-        "-c", "copy", "-y", str(merged),
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+        "-i", str(concat), "-c", "copy", "-y", str(merged),
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
     )
     _, err = await proc.communicate()
-    if proc.returncode:
-        raise RuntimeError("FFmpeg merge failed: " + err.decode(errors="replace")[-1000:])
+    if proc.returncode or not merged.is_file() or merged.stat().st_size <= 256:
+        raise RuntimeError("FFmpeg merge produced no audio: " + err.decode(errors="replace")[-800:])
     return merged
 
 
@@ -323,7 +415,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not task or task.done():
         await update.effective_message.reply_text("No active conversion.")
     elif p:
-        await update.effective_message.reply_text(f"{p['stage']}: {p['done']}/{p['total']}")
+        await update.effective_message.reply_text(progress_text(p['stage'], p['done'], p['total'], p.get("started", time.monotonic())))
     else:
         await update.effective_message.reply_text("Conversion running.")
 
@@ -531,43 +623,53 @@ async def convert_document(update, context, filename):
     message = update.effective_message
     uid = update.effective_user.id
     folder = Path(tempfile.mkdtemp(prefix=f"user-{uid}-", dir=WORK_ROOT))
-    status = await message.reply_text("📥 Downloading file…")
-
+    started = time.monotonic()
+    status = await message.reply_text("📥 Downloading file…\n⏱ Used time: 0m 00s")
     try:
         input_path = folder / Path(filename).name
         await download_input_file(context, message.document.file_id, input_path)
-
-        await status.edit_text("📖 Extracting text…")
+        await status.edit_text(progress_text("📖 Extracting text", 0, 1, started, f"📄 Input size: {fmt_size(input_path.stat().st_size)}"))
         text = extract_text(input_path)
         if not text.strip():
             raise ValueError("No readable text found; scanned PDFs need OCR.")
         if len(text) > MAX_TEXT_CHARS:
             raise ValueError(f"Text exceeds {MAX_TEXT_CHARS:,} characters.")
-
         s = cfg(uid).copy()
-        merged = await generate_audio(text, folder, s, status, uid)
-        await status.edit_text("✂️ Preparing audio parts…")
+        merged = await generate_audio(text, folder, s, status, uid, started)
+        duration, size_bytes = await audio_metadata(merged)
+        await status.edit_text(progress_text("✂️ Preparing audio", 1, 1, started,
+            f"🎧 Audio duration: {fmt_time(duration)}\n📦 File size: {fmt_size(size_bytes)}\n🎙️ Audio made: 1 merged file"))
         parts = await split_audio(merged, folder)
         base = safe_name(s["name"] if s["name"] != "Audiobook" else Path(filename).stem)
-
-        PROGRESS[uid] = {"stage": "Sending", "done": 0, "total": len(parts)}
+        PROGRESS[uid] = {"stage": "📤 Sending audio", "done": 0, "total": len(parts), "started": started}
         for i, part in enumerate(parts, 1):
             if part.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
                 raise RuntimeError("Part exceeds MAX_UPLOAD_MB; lower SEND_PART_MB.")
             outname = f"{base}.mp3" if len(parts) == 1 else f"{base}_part_{i:03d}.mp3"
-            await status.edit_text(f"📤 Sending audio {i}/{len(parts)}…")
+            try:
+                part_duration, part_size = await audio_metadata(part)
+            except Exception:
+                part_duration, part_size = 0, part.stat().st_size
+            details = (f"🎧 Audio duration: {fmt_time(part_duration)}\n" if part_duration else "") + f"📦 File size: {fmt_size(part_size)}\n🎙️ Audio made: {i}/{len(parts)} files"
+            await status.edit_text(progress_text("📤 Sending", i - 1, len(parts), started, details))
             with part.open("rb") as audio:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id, audio=audio,
                     filename=outname, title=Path(outname).stem[:64],
-                    read_timeout=600, write_timeout=600,
-                    connect_timeout=60, pool_timeout=60,
+                    read_timeout=600, write_timeout=600, connect_timeout=60, pool_timeout=60,
                 )
             if part != merged:
                 part.unlink(missing_ok=True)
-            PROGRESS[uid] = {"stage": "Sending", "done": i, "total": len(parts)}
-
-        await status.edit_text(f"✅ Complete! Sent {len(parts)} audio file(s). Temporary files cleared.")
+            PROGRESS[uid] = {"stage": "📤 Sending audio", "done": i, "total": len(parts), "started": started}
+        elapsed = time.monotonic() - started
+        await status.edit_text(
+            f"✅ Conversion complete!\n{progress_bar(len(parts), len(parts))} 100%\n"
+            f"⏱ Used time: {fmt_time(elapsed)}\n"
+            f"⌛ Estimated time: {fmt_time(elapsed)} (actual)\n"
+            f"🎧 Audio duration: {fmt_time(duration)}\n"
+            f"📦 Total audio size: {fmt_size(size_bytes)}\n"
+            f"🎙️ Audio made: {len(parts)} file(s) sent."
+        )
     except asyncio.CancelledError:
         try:
             await status.edit_text("⛔ Conversion cancelled; clearing temporary files.")
@@ -576,11 +678,11 @@ async def convert_document(update, context, filename):
         raise
     except Exception as exc:
         log.exception("Conversion failed")
-        text = f"❌ Conversion failed: {type(exc).__name__}: {str(exc)[:900]}"
+        err_text = f"❌ Conversion failed: {type(exc).__name__}: {str(exc)[:700]}\n⏱ Used time: {fmt_time(time.monotonic() - started)}"
         try:
-            await status.edit_text(text)
+            await status.edit_text(err_text)
         except TelegramError:
-            await message.reply_text(text)
+            await message.reply_text(err_text)
     finally:
         shutil.rmtree(folder, ignore_errors=True)
         PROGRESS.pop(uid, None)
