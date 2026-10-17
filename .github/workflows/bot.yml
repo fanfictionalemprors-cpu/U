@@ -50,7 +50,6 @@ jobs:
             echo "Missing API_ID secret"
             exit 1
           }
-
           test -n "$TELEGRAM_API_HASH" || {
             echo "Missing API_HASH secret"
             exit 1
@@ -65,10 +64,9 @@ jobs:
             --mount type=bind,source=/var/lib/telegram-bot-api,target=/var/lib/telegram-bot-api \
             aiogram/telegram-bot-api:latest
 
-          echo "Waiting for Local Bot API startup..."
+          echo "Waiting for Local Bot API..."
           for i in $(seq 1 30); do
             if ! docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null | grep -q true; then
-              echo "Local Bot API container stopped."
               docker logs --tail 100 telegram-bot-api || true
               exit 1
             fi
@@ -98,6 +96,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           LOCAL_BOT_API: "1"
           LOCAL_BOT_API_URL: "http://127.0.0.1:8081"
+          LOCAL_API_CONTAINER: "telegram-bot-api"
           DEFAULT_ENGINE: "edge"
           DEFAULT_RATE: "+10%"
           DEFAULT_PITCH: "+0Hz"
