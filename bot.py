@@ -9,6 +9,7 @@ import tempfile
 import subprocess
 from pathlib import Path
 from datetime import timedelta
+from urllib.parse import urlparse, unquote
 
 from telegram import Update
 from telegram.ext import (
@@ -39,7 +40,7 @@ except ImportError:
     BeautifulSoup = None
 
 
-# ==================== CONFIG ====================
+# ---------------- CONFIG ----------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 LOCAL_BOT_API = os.getenv("LOCAL_BOT_API", "1").lower() in {
@@ -48,12 +49,17 @@ LOCAL_BOT_API = os.getenv("LOCAL_BOT_API", "1").lower() in {
 LOCAL_BOT_API_URL = os.getenv(
     "LOCAL_BOT_API_URL", "http://127.0.0.1:8081"
 ).rstrip("/")
+LOCAL_API_CONTAINER = os.getenv(
+    "LOCAL_API_CONTAINER", "telegram-bot-api"
+)
 
 MAX_INPUT_MB = int(os.getenv("MAX_INPUT_MB", "1900"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1900"))
 SEND_PART_MB = int(os.getenv("SEND_PART_MB", "1800"))
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "2500"))
-TTS_CONCURRENCY = max(1, min(int(os.getenv("TTS_CONCURRENCY", "3")), 5))
+TTS_CONCURRENCY = max(
+    1, min(int(os.getenv("TTS_CONCURRENCY", "3")), 5)
+)
 
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "edge").lower()
 DEFAULT_RATE = os.getenv("DEFAULT_RATE", "+10%")
@@ -155,7 +161,7 @@ def split_text(text, max_chars=CHUNK_CHARS):
     return chunks
 
 
-# ==================== TEXT EXTRACTION ====================
+# ---------------- FILE TEXT EXTRACTION ----------------
 
 def extract_text(file_path):
     path = Path(file_path)
@@ -176,7 +182,7 @@ def extract_text(file_path):
 
         for table in doc.tables:
             for row in table.rows:
-                lines.append(" | ".join(cell.text for cell in row.cells))
+                lines.append(" | ".join(c.text for c in row.cells))
 
         return "\n\n".join(lines)
 
@@ -185,7 +191,9 @@ def extract_text(file_path):
             raise RuntimeError("pypdf is not installed.")
 
         reader = PdfReader(str(path))
-        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        return "\n\n".join(
+            page.extract_text() or "" for page in reader.pages
+        )
 
     if suffix == ".epub":
         if epub is None or BeautifulSoup is None:
@@ -203,44 +211,45 @@ def extract_text(file_path):
                 for tag in soup(["script", "style"]):
                     tag.decompose()
 
-                section = soup.get_text("\n", strip=True)
-                if section:
-                    sections.append(section)
+                content = soup.get_text("\n", strip=True)
+                if content:
+                    sections.append(content)
 
         return "\n\n".join(sections)
 
     raise ValueError("Supported formats: TXT, DOCX, PDF and EPUB.")
 
 
-# ==================== TTS ====================
+# ---------------- TTS GENERATION ----------------
 
 async def make_edge(text, output_path, settings):
-    voice_key = settings.get("voice", "madhur")
-    voice = VOICES.get(voice_key, VOICES["madhur"])["voice"]
+    voice = VOICES.get(
+        settings.get("voice", "madhur"), VOICES["madhur"]
+    )["voice"]
 
-    # Proxy removed.
     communicate = Communicate(
         text=text,
         voice=voice,
         rate=settings.get("rate", DEFAULT_RATE),
         pitch=settings.get("pitch", DEFAULT_PITCH),
     )
-
+    # No proxy.
     await communicate.save(str(output_path))
 
     if not Path(output_path).is_file() or Path(output_path).stat().st_size == 0:
-        raise RuntimeError("Edge TTS produced an empty file.")
+        raise RuntimeError("Edge TTS generated an empty file.")
 
 
 async def make_google(text, output_path, settings):
-    voice_key = settings.get("voice", "madhur")
-    lang = VOICES.get(voice_key, VOICES["madhur"])["lang"]
+    lang = VOICES.get(
+        settings.get("voice", "madhur"), VOICES["madhur"]
+    )["lang"]
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.unlink(missing_ok=True)
 
-    # No unsupported session= or proxies= constructor arguments.
+    # Do not pass unsupported session= or proxies= arguments.
     tts = gTTS(
         text=text,
         lang=lang,
@@ -254,7 +263,7 @@ async def make_google(text, output_path, settings):
     )
 
     if not output_path.is_file() or output_path.stat().st_size == 0:
-        raise RuntimeError("Google TTS produced an empty file.")
+        raise RuntimeError("Google TTS generated an empty file.")
 
 
 async def generate_chunk(index, text, output_path, settings, semaphore):
@@ -268,7 +277,6 @@ async def generate_chunk(index, text, output_path, settings, semaphore):
                     await make_google(text, output_path, settings)
                 else:
                     await make_edge(text, output_path, settings)
-
                 return output_path
 
             except Exception as exc:
@@ -279,11 +287,9 @@ async def generate_chunk(index, text, output_path, settings, semaphore):
                     attempt + 1,
                     type(exc).__name__,
                 )
-
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)
 
-        # One fallback attempt using Google TTS.
         if engine != "google":
             try:
                 await make_google(text, output_path, settings)
@@ -297,51 +303,96 @@ async def generate_chunk(index, text, output_path, settings, semaphore):
         ) from last_error
 
 
-# ==================== LOCAL API FILE DOWNLOAD ====================
+# ---------------- LOCAL BOT API DOWNLOAD FIX ----------------
+
+def copy_from_api_container(remote_path, output_path):
+    """
+    Copies a file from the Local Bot API Docker container.
+    This avoids constructing an invalid /file/bot... absolute-path URL.
+    """
+    remote_path = unquote(str(remote_path or "")).strip()
+
+    # The API may return a URL instead of a filesystem path.
+    if remote_path.startswith(("http://", "https://")):
+        parsed = urlparse(remote_path)
+        remote_path = unquote(parsed.path)
+
+        marker = "/file/bot"
+        pos = remote_path.find(marker)
+        if pos >= 0:
+            remote_path = remote_path[pos + len(marker):]
+            # Remove the bot token prefix from the URL path.
+            first_slash = remote_path.find("/")
+            if first_slash >= 0:
+                remote_path = remote_path[first_slash:]
+
+    # Local Bot API file paths are absolute server-side paths.
+    if not remote_path.startswith("/"):
+        raise RuntimeError(
+            "Local Bot API did not return an absolute file path."
+        )
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # First try the shared host filesystem.
+    candidate = Path(remote_path)
+    if candidate.is_file():
+        shutil.copy2(candidate, output_path)
+        if output_path.is_file() and output_path.stat().st_size > 0:
+            return output_path
+
+    # If the file is only visible inside Docker, copy it out.
+    result = subprocess.run(
+        [
+            "docker",
+            "cp",
+            f"{LOCAL_API_CONTAINER}:{remote_path}",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    if result.returncode != 0:
+        log.error("docker cp failed: %s", result.stderr[-1000:])
+        raise RuntimeError(
+            "Could not copy the received file from the Local Bot API "
+            "container. Check container name, returned file path, and "
+            "shared storage. Docker error: "
+            + result.stderr[-800:]
+        )
+
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError("Copied input file is missing or empty.")
+
+    return output_path
+
 
 async def download_input(document, output_path):
-    """
-    Local Bot API may return an absolute server-side file path.
-    The workflow mounts /var/lib/telegram-bot-api at the same
-    path on the runner, so copy directly when the file exists.
-    """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     tg_file = await document.get_file()
     remote_path = str(tg_file.file_path or "")
 
-    log.info(
-        "Received file path from Telegram API; checking local accessibility."
-    )
-
-    if LOCAL_BOT_API and remote_path:
-        candidate = Path(remote_path)
-
-        if candidate.is_absolute() and candidate.is_file():
-            shutil.copy2(candidate, output_path)
-
-            if output_path.is_file() and output_path.stat().st_size > 0:
-                return output_path
-
-        log.warning(
-            "Local file path is unavailable to the runner; "
-            "trying the configured API file URL."
+    if LOCAL_BOT_API:
+        return await asyncio.to_thread(
+            copy_from_api_container,
+            remote_path,
+            output_path,
         )
 
-    # Fallback through python-telegram-bot's configured file URL.
     await tg_file.download_to_drive(custom_path=str(output_path))
 
     if not output_path.is_file() or output_path.stat().st_size == 0:
-        raise RuntimeError(
-            "File download returned no data. Check the Local Bot API "
-            "file route and shared storage mount."
-        )
+        raise RuntimeError("Downloaded input file is empty or missing.")
 
     return output_path
 
 
-# ==================== AUDIO / FFMPEG ====================
+# ---------------- FFMPEG HELPERS ----------------
 
 def run_command(args):
     result = subprocess.run(
@@ -350,22 +401,18 @@ def run_command(args):
         stderr=subprocess.PIPE,
         text=True,
     )
-
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-1500:] or "Command failed.")
-
     return result
 
 
 def get_duration(path):
     result = run_command([
-        "ffprobe",
-        "-v", "error",
+        "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(path),
     ])
-
     try:
         return float(result.stdout.strip())
     except (TypeError, ValueError):
@@ -384,13 +431,10 @@ def merge_audio(audio_paths, output_path, work_dir):
             f.write(f"file '{safe_path}'\n")
 
     run_command([
-        "ffmpeg",
-        "-hide_banner", "-loglevel", "error",
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "concat", "-safe", "0",
         "-i", str(list_file),
-        "-vn",
-        "-c:a", "libmp3lame",
-        "-b:a", "64k",
+        "-vn", "-c:a", "libmp3lame", "-b:a", "64k",
         "-y", str(output_path),
     ])
 
@@ -410,41 +454,42 @@ def split_large_audio(audio_path, work_dir, max_bytes):
     if duration <= 0:
         raise RuntimeError("Could not determine audio duration.")
 
-    parts_needed = (audio_path.stat().st_size + max_bytes - 1) // max_bytes
+    parts_needed = (
+        audio_path.stat().st_size + max_bytes - 1
+    ) // max_bytes
+
     part_duration = max(30, int(duration / parts_needed))
     pattern = str(Path(work_dir) / "part_%03d.mp3")
 
     run_command([
-        "ffmpeg",
-        "-hide_banner", "-loglevel", "error",
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-i", str(audio_path),
         "-f", "segment",
         "-segment_time", str(part_duration),
         "-reset_timestamps", "1",
-        "-c:a", "libmp3lame",
-        "-b:a", "48k",
+        "-c:a", "libmp3lame", "-b:a", "48k",
         "-y", pattern,
     ])
 
     parts = sorted(Path(work_dir).glob("part_*.mp3"))
-
     if not parts:
         raise RuntimeError("Audio splitting produced no files.")
 
     for part in parts:
         if part.stat().st_size > max_bytes:
             raise RuntimeError(
-                f"{part.name} exceeds the configured upload size."
+                f"{part.name} exceeds the configured part size. "
+                "Lower SEND_PART_MB."
             )
 
     return parts
 
 
-# ==================== COMMANDS ====================
+# ---------------- COMMANDS ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "🎧 Novel TTS Bot\n\n"
+        "Novel TTS Bot\n\n"
         "Send TXT, DOCX, PDF or EPUB.\n\n"
         "/voice — select voice\n"
         "/engine edge or /engine google\n"
@@ -452,7 +497,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pitch +0Hz\n"
         "/name My Audiobook\n"
         "/status — progress\n"
-        "/cancel — cancel current job\n\n"
+        "/cancel — cancel job\n\n"
         "Voices: madhur, swara, guy, jenny"
     )
 
@@ -462,15 +507,15 @@ async def voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = settings_for(uid)
 
     if not context.args:
-        lines = [
-            f"{key}: {item['name']}"
-            for key, item in VOICES.items()
-        ]
-        await update.effective_message.reply_text("\n".join(lines))
+        await update.effective_message.reply_text(
+            "\n".join(
+                f"{key}: {value['name']}"
+                for key, value in VOICES.items()
+            )
+        )
         return
 
     choice = context.args[0].lower()
-
     if choice not in VOICES:
         await update.effective_message.reply_text(
             "Choose madhur, swara, guy or jenny."
@@ -552,7 +597,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("No active job.")
 
 
-# ==================== DOCUMENT HANDLER ====================
+# ---------------- DOCUMENT HANDLER ----------------
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -628,11 +673,10 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 size_mb = sum(
                     p.stat().st_size for p in paths if p.exists()
                 ) / 1048576
-
                 percent = completed / len(chunks) * 100
 
                 status = (
-                    f"🎙️ Audio generation\n\n"
+                    f"Audio generation\n\n"
                     f"{progress_bar(percent)} {percent:.1f}%\n"
                     f"Audio made: {completed}/{len(chunks)} chunks\n"
                     f"Estimated audio: {format_time(total_chars / 12)}\n"
@@ -671,23 +715,17 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             output_path = work_dir / f"{output_name}.mp3"
 
             await status_message.edit_text("Merging audio chunks...")
-
             await asyncio.to_thread(
                 merge_audio, paths, output_path, work_dir
             )
 
             max_bytes = min(SEND_PART_MB, MAX_UPLOAD_MB) * 1024 * 1024
-
             parts = await asyncio.to_thread(
-                split_large_audio,
-                output_path,
-                work_dir,
-                max_bytes,
+                split_large_audio, output_path, work_dir, max_bytes
             )
 
             for part_index, part in enumerate(parts, start=1):
                 caption = output_name
-
                 if len(parts) > 1:
                     caption += f" — Part {part_index}/{len(parts)}"
 
@@ -703,9 +741,8 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
 
             elapsed = time.monotonic() - started
-
             await status_message.edit_text(
-                f"✅ Completed\n"
+                f"Completed!\n"
                 f"Chunks: {len(chunks)}\n"
                 f"Parts sent: {len(parts)}\n"
                 f"Used time: {format_time(elapsed)}\n"
@@ -723,7 +760,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.exception("TTS job failed")
             try:
                 await status_message.edit_text(
-                    f"❌ Job failed:\n{str(exc)[:2500]}"
+                    f"Job failed:\n{str(exc)[:2500]}"
                 )
             except Exception:
                 pass
@@ -733,23 +770,18 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.rmtree(work_dir, ignore_errors=True)
 
     task = asyncio.create_task(run_job())
-    USER_JOBS[uid] = {
-        "task": task,
-        "status": "Job started.",
-    }
+    USER_JOBS[uid] = {"task": task, "status": "Job started."}
 
 
 async def error_handler(update, context):
     log.error("Telegram handler error", exc_info=context.error)
 
 
-# ==================== MAIN ====================
+# ---------------- MAIN ----------------
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN is missing from GitHub Actions Secrets."
-        )
+        raise RuntimeError("BOT_TOKEN is missing from GitHub Secrets.")
 
     builder = Application.builder().token(BOT_TOKEN)
 
@@ -774,7 +806,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_error_handler(error_handler)
 
-    log.info("Starting TTS bot; Local Bot API enabled=%s", LOCAL_BOT_API)
+    log.info("Local Bot API enabled: %s", LOCAL_BOT_API)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
