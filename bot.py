@@ -405,7 +405,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def download_input_file(context, file_id, input_path):
-    """Download an input file from Telegram or the Local Bot API container."""
+    """Download input from Telegram, robustly resolving Local Bot API paths."""
     from urllib.parse import urlsplit, unquote
 
     tg_file = await context.bot.get_file(file_id)
@@ -422,9 +422,9 @@ async def download_input_file(context, file_id, input_path):
     if not returned_path:
         raise FileNotFoundError("Local Bot API getFile returned an empty path.")
 
-    source_path = None
+    candidates = []
     if os.path.isabs(returned_path):
-        source_path = Path("/" + returned_path.lstrip("/"))
+        candidates.append(Path("/" + returned_path.lstrip("/")))
     else:
         parsed = urlsplit(returned_path)
         url_path = unquote(parsed.path) if parsed.scheme in {"http", "https"} else returned_path
@@ -434,43 +434,85 @@ async def download_input_file(context, file_id, input_path):
             after_marker = url_path[marker_pos + len(marker):]
             slash_pos = after_marker.find("/")
             if slash_pos >= 0:
-                raw_server_path = after_marker[slash_pos:].lstrip("/")
-                if raw_server_path:
-                    source_path = Path("/" + raw_server_path)
+                candidates.append(Path("/" + after_marker[slash_pos:].lstrip("/")))
         elif url_path.startswith("/"):
-            # Some Local Bot API builds return the absolute server path.
-            source_path = Path("/" + url_path.lstrip("/"))
+            candidates.append(Path("/" + url_path.lstrip("/")))
 
-    if source_path is None or not source_path.is_absolute():
-        raise ValueError("Could not parse Local Bot API file path; check the local API configuration.")
+    for source_path in candidates:
+        try:
+            if source_path.is_file():
+                shutil.copyfile(source_path, destination)
+                if destination.is_file() and destination.stat().st_size > 0:
+                    log.info("Input copied from shared Local Bot API storage.")
+                    return destination
+        except OSError:
+            pass
 
-    # First try the shared host mount. If it is root-owned/unreadable, fall
-    # through to docker cp instead of failing with PermissionError.
-    try:
-        if source_path.is_file():
-            shutil.copyfile(source_path, destination)
-            if destination.is_file() and destination.stat().st_size > 0:
-                log.info("Input copied from shared Local Bot API storage.")
-                return destination
-    except OSError:
-        pass
+    async def run_docker(*args):
+        """Run Docker without sudo first, then try sudo for runner permissions."""
+        last_error = b""
+        for prefix in (("docker",), ("sudo", "docker")):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *prefix, *args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    return stdout, b""
+                last_error = stderr or stdout
+            except FileNotFoundError as exc:
+                last_error = str(exc).encode()
+        return b"", last_error
 
-    # The file may only be readable inside the Local Bot API Docker container.
-    proc = await asyncio.create_subprocess_exec(
-        "docker", "cp", f"{LOCAL_API_CONTAINER}:{source_path}", str(destination),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    _, err = await proc.communicate()
-    if proc.returncode != 0 or not destination.is_file() or destination.stat().st_size == 0:
-        # Do not expose the returned URL or token in the user-facing error.
-        detail = err.decode("utf-8", errors="replace")[-500:].replace(BOT_TOKEN, "[REDACTED]")
-        raise RuntimeError(
-            "Could not copy the uploaded file from Local Bot API storage. "
-            f"Check LOCAL_API_CONTAINER and Docker volume/path configuration. {detail}"
+    last_err = b""
+    for source_path in candidates:
+        _, last_err = await run_docker(
+            "cp", f"{LOCAL_API_CONTAINER}:{source_path}", str(destination)
         )
+        if destination.is_file() and destination.stat().st_size > 0:
+            log.info("Input copied from Local Bot API container using returned path.")
+            return destination
+        destination.unlink(missing_ok=True)
 
-    log.info("Input copied from Local Bot API container.")
-    return destination
+    # Local Bot API can return only /documents/file_0.txt, although the file
+    # is actually stored under /var/lib/telegram-bot-api/<token>/documents/.
+    # Search inside the container rather than guessing that path.
+    basename = Path(returned_path.split("?", 1)[0]).name
+    if not basename or basename in {".", ".."}:
+        raise RuntimeError("Local Bot API returned an invalid uploaded-file path.")
+
+    found, find_err = await run_docker(
+        "exec", LOCAL_API_CONTAINER, "find", "/", "-type", "f", "-name", basename
+    )
+    found_paths = []
+    if found:
+        for line in found.decode("utf-8", errors="replace").splitlines():
+            path = line.strip()
+            if path.startswith("/") and path not in found_paths:
+                found_paths.append(path)
+
+    copy_errors = []
+    for actual_path in found_paths:
+        _, copy_err = await run_docker(
+            "cp", f"{LOCAL_API_CONTAINER}:{actual_path}", str(destination)
+        )
+        if destination.is_file() and destination.stat().st_size > 0:
+            log.info("Input copied from Local Bot API container after path lookup.")
+            return destination
+        destination.unlink(missing_ok=True)
+        if copy_err:
+            copy_errors.append(copy_err.decode("utf-8", errors="replace"))
+
+    details = copy_errors[-1] if copy_errors else last_err.decode("utf-8", errors="replace")
+    details = details[-500:].replace(BOT_TOKEN, "[REDACTED]")
+    if find_err:
+        details = (details + " " + find_err.decode("utf-8", errors="replace")[-250:])
+    raise RuntimeError(
+        f"Could not locate uploaded file '{basename}' inside Local Bot API container "
+        f"'{LOCAL_API_CONTAINER}'. The returned path and container search both failed. {details}"
+    )
 
 
 async def convert_document(update, context, filename):
