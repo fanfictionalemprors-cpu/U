@@ -1,3 +1,4 @@
+
 name: Telegram TTS Bot
 
 on:
@@ -25,6 +26,7 @@ jobs:
       LOCAL_BOT_API: "true"
       LOCAL_BOT_API_URL: "http://127.0.0.1:8081"
       LOCAL_API_CONTAINER: "telegram-bot-api"
+      SEND_PART_MB: "1800"
 
     steps:
       - name: Checkout repository
@@ -38,12 +40,24 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          set -e
           sudo apt-get update
-          sudo apt-get install -y ffmpeg docker.io
+          sudo apt-get install -y ffmpeg curl
           python -m pip install --upgrade pip
+
+      - name: Check Docker
+        run: |
+          set -e
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::error::Docker CLI is not available on this runner. Do not install docker.io here because it conflicts with preinstalled containerd packages."
+            exit 1
+          fi
+          docker --version
+          sudo docker info
 
       - name: Install Python dependencies
         run: |
+          set -e
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
@@ -61,19 +75,16 @@ jobs:
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
           set -euo pipefail
 
-          : "${TELEGRAM_API_ID:?Add TELEGRAM_API_ID in GitHub Secrets}"
-          : "${TELEGRAM_API_HASH:?Add TELEGRAM_API_HASH in GitHub Secrets}"
-          : "${BOT_TOKEN:?Add BOT_TOKEN in GitHub Secrets}"
+          : "${TELEGRAM_API_ID:?Missing TELEGRAM_API_ID secret}"
+          : "${TELEGRAM_API_HASH:?Missing TELEGRAM_API_HASH secret}"
 
-          sudo systemctl start docker
+          sudo docker rm -f telegram-bot-api 2>/dev/null || true
 
           sudo docker run -d \
             --name telegram-bot-api \
-            --restart unless-stopped \
             -p 127.0.0.1:8081:8081 \
             -v telegram-bot-api-data:/var/lib/telegram-bot-api \
             aiogram/telegram-bot-api:latest \
@@ -82,15 +93,25 @@ jobs:
             --local
 
           echo "Waiting for Local Bot API..."
+          ready=0
           for i in $(seq 1 30); do
-            if sudo docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null | grep -q true; then
+            if ! sudo docker inspect -f '{{.State.Running}}' telegram-bot-api 2>/dev/null | grep -q true; then
+              sudo docker logs --tail 100 telegram-bot-api || true
+              exit 1
+            fi
+            if curl -sS --max-time 2 http://127.0.0.1:8081/ >/dev/null 2>&1; then
+              ready=1
+              echo "Local Bot API is responding."
               break
             fi
             sleep 2
           done
 
-          sudo docker ps --filter name=telegram-bot-api
-          sudo docker logs --tail 50 telegram-bot-api
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::Local Bot API did not respond on port 8081."
+            sudo docker logs --tail 100 telegram-bot-api || true
+            exit 1
+          fi
 
       - name: Run Telegram bot
         env:
@@ -100,9 +121,10 @@ jobs:
           LOCAL_BOT_API: "true"
           LOCAL_BOT_API_URL: "http://127.0.0.1:8081"
           LOCAL_API_CONTAINER: "telegram-bot-api"
-          SEND_PART_MB: "50"
+          SEND_PART_MB: "1800"
         run: |
           set -euo pipefail
+          : "${BOT_TOKEN:?Missing BOT_TOKEN secret}"
           python -u bot.py
 
       - name: Show Local Bot API logs if job fails
@@ -110,7 +132,7 @@ jobs:
         run: |
           sudo docker logs --tail 100 telegram-bot-api || true
 
-      - name: Stop Local Bot API
+      - name: Stop Local Telegram Bot API
         if: always()
         run: |
           sudo docker rm -f telegram-bot-api || true
