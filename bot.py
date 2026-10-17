@@ -37,6 +37,7 @@ MAX_INPUT_MB = int(os.getenv("MAX_INPUT_MB", "1900" if LOCAL_BOT_API else "50"))
 SEND_PART_MB = int(os.getenv("SEND_PART_MB", "1800" if LOCAL_BOT_API else "45"))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "20000000"))
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "2500"))
+TTS_CONCURRENCY = max(1, min(4, int(os.getenv("TTS_CONCURRENCY", "3"))))
 WORK_ROOT = Path(os.getenv("TTS_WORKDIR", "/tmp/telegram-tts-work"))
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -199,55 +200,96 @@ async def make_google(text, path, s):
 
 
 async def generate_audio(text, folder, s, status, uid, started):
+    """Generate chunks concurrently (up to 4), preserving chapter order in final audio."""
     chunks = split_text(text)
     if not chunks:
         raise ValueError("No readable text found.")
-    pieces = []
-    PROGRESS[uid] = {"stage": "Generating audio", "done": 0, "total": len(chunks), "started": started}
-    for i, chunk in enumerate(chunks, 1):
-        out = folder / f"chunk_{i:06d}.mp3"
-        if s["engine"] == "google":
-            await make_google(chunk, out, s)
-        else:
-            try:
-                await make_edge(chunk, out, s)
-            except Exception as first_error:
-                if len(chunk) < 500:
-                    raise
-                log.warning("Edge TTS chunk %s failed; retrying in smaller pieces: %s", i, first_error)
-                mid = len(chunk) // 2
-                cut = chunk.rfind(" ", 0, mid)
-                if cut < len(chunk) // 4:
-                    cut = mid
-                subtexts = [chunk[:cut].strip(), chunk[cut:].strip()]
-                subpaths = []
-                for j, subtext in enumerate(subtexts, 1):
-                    subpath = folder / f"chunk_{i:06d}_sub_{j}.mp3"
-                    await make_edge(subtext, subpath, s)
-                    subpaths.append(subpath)
-                sublist = folder / f"subconcat_{i:06d}.txt"
-                sublist.write_text("".join(f"file '{x.as_posix()}'\n" for x in subpaths), encoding="utf-8")
-                proc_sub = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
-                    "-i", str(sublist), "-c", "copy", "-y", str(out),
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-                )
-                _, suberr = await proc_sub.communicate()
-                if proc_sub.returncode or not out.is_file() or out.stat().st_size <= 256:
-                    raise RuntimeError("Edge TTS returned no audio even after splitting the failed chunk. " + suberr.decode(errors="replace")[-400:]) from first_error
-                for sp in subpaths:
-                    sp.unlink(missing_ok=True)
-                sublist.unlink(missing_ok=True)
-        if not out.is_file() or out.stat().st_size <= 256:
-            raise RuntimeError(f"TTS produced no audio for chunk {i}/{len(chunks)}.")
-        pieces.append(out)
-        PROGRESS[uid] = {"stage": "Generating audio", "done": i, "total": len(chunks), "started": started}
-        if i == 1 or i % 2 == 0 or i == len(chunks):
-            extra = f"🎧 Audio made: {i}/{len(chunks)} chunks"
-            try:
-                await status.edit_text(progress_text("🎙️ Generating", i, len(chunks), started, extra))
-            except TelegramError:
-                pass
+
+    semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
+    pieces = [folder / f"chunk_{i:06d}.mp3" for i in range(1, len(chunks) + 1)]
+    completed = 0
+    completed_duration = 0.0
+    completed_bytes = 0
+    status_lock = asyncio.Lock()
+    PROGRESS[uid] = {
+        "stage": "Generating audio", "done": 0, "total": len(chunks),
+        "started": started, "audio_duration": 0.0, "audio_bytes": 0,
+        "concurrency": TTS_CONCURRENCY,
+    }
+
+    async def generate_one(index, chunk):
+        nonlocal completed, completed_duration, completed_bytes
+        out = pieces[index]
+        async with semaphore:
+            if s["engine"] == "google":
+                await make_google(chunk, out, s)
+            else:
+                try:
+                    await make_edge(chunk, out, s)
+                except Exception as first_error:
+                    if len(chunk) < 500:
+                        raise
+                    log.warning("Edge TTS chunk %s failed; retrying in smaller pieces: %s", index + 1, first_error)
+                    mid = len(chunk) // 2
+                    cut = chunk.rfind(" ", 0, mid)
+                    if cut < len(chunk) // 4:
+                        cut = mid
+                    subtexts = [chunk[:cut].strip(), chunk[cut:].strip()]
+                    subpaths = []
+                    try:
+                        for j, subtext in enumerate(subtexts, 1):
+                            subpath = folder / f"chunk_{index + 1:06d}_sub_{j}.mp3"
+                            await make_edge(subtext, subpath, s)
+                            subpaths.append(subpath)
+                        sublist = folder / f"subconcat_{index + 1:06d}.txt"
+                        sublist.write_text("".join(f"file '{x.as_posix()}'\n" for x in subpaths), encoding="utf-8")
+                        proc_sub = await asyncio.create_subprocess_exec(
+                            "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                            "-i", str(sublist), "-c", "copy", "-y", str(out),
+                            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+                        )
+                        _, suberr = await proc_sub.communicate()
+                        sublist.unlink(missing_ok=True)
+                        if proc_sub.returncode or not out.is_file() or out.stat().st_size <= 256:
+                            raise RuntimeError("Edge TTS returned no audio even after splitting the failed chunk. " + suberr.decode(errors="replace")[-400:]) from first_error
+                    finally:
+                        for sp in subpaths:
+                            sp.unlink(missing_ok=True)
+
+            if not out.is_file() or out.stat().st_size <= 256:
+                raise RuntimeError(f"TTS produced no audio for chunk {index + 1}/{len(chunks)}.")
+            duration, size = await audio_metadata(out)
+            async with status_lock:
+                completed += 1
+                completed_duration += duration
+                completed_bytes += size
+                PROGRESS[uid] = {
+                    "stage": "Generating audio", "done": completed, "total": len(chunks),
+                    "started": started, "audio_duration": completed_duration,
+                    "audio_bytes": completed_bytes, "concurrency": TTS_CONCURRENCY,
+                }
+                if completed == 1 or completed % 2 == 0 or completed == len(chunks):
+                    extra = (
+                        f"🎧 Audio made: {completed}/{len(chunks)} chunks\n"
+                        f"⏱ Audio duration made: {fmt_time(completed_duration)}\n"
+                        f"📦 Generated audio size: {fmt_size(completed_bytes)}\n"
+                        f"⚡ Parallel workers: {TTS_CONCURRENCY}"
+                    )
+                    try:
+                        await status.edit_text(progress_text("🎙️ Generating", completed, len(chunks), started, extra))
+                    except TelegramError:
+                        pass
+
+    tasks = [asyncio.create_task(generate_one(i, chunk)) for i, chunk in enumerate(chunks)]
+    try:
+        await asyncio.gather(*tasks)
+    except Exception:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
     concat = folder / "concat.txt"
     concat.write_text("".join(f"file '{x.as_posix()}'\n" for x in pieces), encoding="utf-8")
     merged = folder / "merged.mp3"
@@ -415,7 +457,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not task or task.done():
         await update.effective_message.reply_text("No active conversion.")
     elif p:
-        await update.effective_message.reply_text(progress_text(p['stage'], p['done'], p['total'], p.get("started", time.monotonic())))
+        extra = ""
+        if p.get("audio_duration") is not None:
+            extra = (f"🎧 Audio duration made: {fmt_time(p.get('audio_duration', 0))}\n"
+                     f"📦 Generated audio size: {fmt_size(p.get('audio_bytes', 0))}\n"
+                     f"⚡ Parallel workers: {p.get('concurrency', TTS_CONCURRENCY)}")
+        await update.effective_message.reply_text(progress_text(p['stage'], p['done'], p['total'], p.get("started", time.monotonic()), extra))
     else:
         await update.effective_message.reply_text("Conversion running.")
 
