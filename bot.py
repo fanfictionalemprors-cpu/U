@@ -40,7 +40,7 @@ MAX_INPUT_MB = int(os.getenv("MAX_INPUT_MB", "1900" if LOCAL_BOT_API else "20"))
 SEND_PART_MB = int(os.getenv("SEND_PART_MB", "1800" if LOCAL_BOT_API else "45"))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "20000000"))
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "2500"))
-TTS_CONCURRENCY = max(1, min(8, int(os.getenv("TTS_CONCURRENCY", "4"))))
+TTS_CONCURRENCY = max(1, min(8, int(os.getenv("TTS_CONCURRENCY", "6"))))
 MAX_QUEUE = max(1, int(os.getenv("MAX_QUEUE", "8")))
 PROGRESS_EDIT_SECONDS =float(os.getenv("PROGRESS_EDIT_SECONDS", "3"))
 WORK_ROOT = Path(os.getenv("TTS_WORKDIR", "/tmp/telegram-tts-work"))
@@ -123,6 +123,7 @@ SKIPPED = {}
 QUEUES = {}     # uid -> waiting jobs
 CURRENT = {}    # uid -> running job
 WORKERS = {}    # uid -> queue worker task
+BG_TASKS = set()  # keeps fire-and-forget tasks alive
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -321,7 +322,7 @@ async def make_edge(text, path, s, attempts=3):
             last_error = exc
             path.unlink(missing_ok=True)
             if attempt < attempts:
-                await asyncio.sleep(attempt * 1.5)
+                await asyncio.sleep(0.5 * attempt)
     raise RuntimeError(
         f"Edge TTS failed after {attempts} attempts ({type(last_error).__name__}: {last_error}). "
         "Try /engine google, or retry later if the TTS service is temporarily unavailable."
@@ -390,10 +391,12 @@ async def edge_robust(text, out, folder, tag, s, skipped, depth=0):
     A fragment that still cannot be spoken (symbols, page junk) becomes brief silence
     so one bad piece never kills a whole audiobook."""
     try:
-        await make_edge(text, out, s, attempts=2 if depth else 3)
+        # Fast path: one retry at the top level, a single try on split fragments,
+        # so a bad piece costs seconds, not minutes.
+        await make_edge(text, out, s, attempts=1 if depth else 2)
         return
     except Exception as exc:
-        if len(text) > 120 and depth < 6:
+        if len(text) > 200 and depth < 4:
             mid = len(text) // 2
             cut = max(text.rfind(". ", 0, mid + 200), text.rfind("। ", 0, mid + 200), text.rfind(" ", 0, mid))
             if cut < len(text) // 4 or cut > len(text) * 3 // 4:
@@ -472,9 +475,13 @@ async def generate_audio(text, folder, s, status, uid, started):
                         f"📦 Generated audio size: {fmt_size(total_bytes)}\n"
                         f"⚡ Parallel workers: {TTS_CONCURRENCY}"
                     )
-                    await safe_edit(status, progress_text("🎙️ Generating", done, total, started, extra))
+                    # fire-and-forget: a slow Telegram call must never hold up a TTS worker
+                    edit_task = asyncio.create_task(
+                        safe_edit(status, progress_text("🎙️ Generating", done, total, started, extra)))
+                    BG_TASKS.add(edit_task)
+                    edit_task.add_done_callback(BG_TASKS.discard)
 
-    tasks = [asyncio.create_task(generate_one(i, chunk)) for i, chunk in enumerate(chunks)]
+    tasks =[asyncio.create_task(generate_one(i, chunk)) for i, chunk in enumerate(chunks)]
     try:
         await asyncio.gather(*tasks)
     except BaseException:
