@@ -1262,10 +1262,52 @@ def cleanup_stale_workdirs():
         shutil.rmtree(old, ignore_errors=True)
 
 
+def wait_for_bot_api(max_wait=300):
+    """Block until the (local) Bot API answers getMe. Its port opens before it has
+    finished connecting to Telegram, and PTB's default 5 s timeout then kills startup."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    url = f"{LOCAL_BOT_API_URL}/bot{BOT_TOKEN}/getMe"
+    deadline = time.monotonic() + max_wait
+    attempt = 0
+    while True:
+        attempt += 1
+        pause = 3
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                if resp.status == 200:
+                    log.info("Local Bot API is ready (attempt %s).", attempt)
+                    return
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 404):
+                raise SystemExit("Bot API rejected BOT_TOKEN (401/404). Check the BOT_TOKEN secret.")
+            if exc.code == 429:
+                try:
+                    pause = int(_json.loads(exc.read()).get("parameters", {}).get("retry_after", 5)) + 1
+                except Exception:
+                    pause = 5
+            log.warning("Bot API getMe returned HTTP %s (attempt %s).", exc.code, attempt)
+        except Exception as exc:                      # timeout / connection refused while it starts
+            log.info("Waiting for Bot API… (%s, attempt %s)", type(exc).__name__, attempt)
+        if time.monotonic() > deadline:
+            log.warning("Bot API still not answering after %ss; trying to start anyway.", max_wait)
+            return
+        time.sleep(min(pause, 60))
+
+
 def main():
     load_settings()
     cleanup_stale_workdirs()
-    builder = Application.builder().token(BOT_TOKEN).concurrent_updates(True)
+    if LOCAL_BOT_API:
+        wait_for_bot_api()
+    builder = (
+        Application.builder().token(BOT_TOKEN).concurrent_updates(True)
+        .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
+        .get_updates_connect_timeout(30).get_updates_read_timeout(40)
+        .get_updates_write_timeout(30).get_updates_pool_timeout(30)
+    )
     if LOCAL_BOT_API:
         builder = (
             builder
