@@ -41,7 +41,8 @@ SEND_PART_MB = int(os.getenv("SEND_PART_MB", "1800" if LOCAL_BOT_API else "45"))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "20000000"))
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "2500"))
 TTS_CONCURRENCY = max(1, min(8, int(os.getenv("TTS_CONCURRENCY", "4"))))
-PROGRESS_EDIT_SECONDS = float(os.getenv("PROGRESS_EDIT_SECONDS", "3"))
+MAX_QUEUE = max(1, int(os.getenv("MAX_QUEUE", "8")))
+PROGRESS_EDIT_SECONDS =float(os.getenv("PROGRESS_EDIT_SECONDS", "3"))
 WORK_ROOT = Path(os.getenv("TTS_WORKDIR", "/tmp/telegram-tts-work"))
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE", str(Path(__file__).resolve().parent / "bot_data" / "settings.json")))
@@ -119,6 +120,9 @@ SETTINGS = {}
 TASKS = {}
 PROGRESS = {}
 SKIPPED = {}
+QUEUES = {}     # uid -> waiting jobs
+CURRENT = {}    # uid -> running job
+WORKERS = {}    # uid -> queue worker task
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -538,8 +542,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/rate 1.5 — Rate (0.5–2.0)\n/speed 1.5 — Rate alias\n"
         "/pitch 5 — Pitch (-20 to +20 Hz)\n/engine edge|google — Engine\n"
         "/name My Audiobook — Output filename\n/demo [voice|all] — Voice demo\n"
-        "/status — Progress\n/cancel — Cancel conversion\n\n"
-        "Send a file, or plain text, to convert it to audio."
+        "/status — Progress\n/queue — Show queue\n/cancel — Cancel running job\n"
+        "/clearqueue — Remove waiting jobs\n/cancelall — Cancel everything\n\n"
+        f"Send a file, or plain text, to convert it. You can send up to {MAX_QUEUE} files at once; "
+        "they are converted one after another."
     )
 
 
@@ -674,11 +680,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not task or task.done():
         await update.effective_message.reply_text("No active conversion.")
     elif p:
-        extra = ""
+        extra = f"📋 Queue: job 1 of {queue_size(update.effective_user.id)} — {CURRENT.get(update.effective_user.id, {}).get('label', '')}\n"
         if p.get("audio_duration") is not None:
-            extra = (f"🎧 Audio duration made: ~{fmt_time(p.get('audio_duration', 0))}\n"
-                     f"📦 Generated audio size: {fmt_size(p.get('audio_bytes', 0))}\n"
-                     f"⚡ Parallel workers: {p.get('concurrency', TTS_CONCURRENCY)}")
+            extra += (f"🎧 Audio duration made: ~{fmt_time(p.get('audio_duration', 0))}\n"
+                      f"📦 Generated audio size: {fmt_size(p.get('audio_bytes', 0))}\n"
+                      f"⚡ Parallel workers: {p.get('concurrency', TTS_CONCURRENCY)}")
         await update.effective_message.reply_text(
             progress_text(p["stage"], p["done"], p["total"], p.get("started", time.monotonic()), extra))
     else:
@@ -691,7 +697,10 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("No active conversion.")
         return
     task.cancel()
-    await update.effective_message.reply_text("Cancellation requested; temporary files will be cleared.")
+    waiting = len(QUEUES.get(update.effective_user.id, []))
+    await update.effective_message.reply_text(
+        "Cancellation requested; temporary files will be cleared."
+        + (f"\nNext in queue starts automatically ({waiting} waiting). Use /cancelall to stop everything." if waiting else ""))
 
 
 async def send_demo(message, uid, voice):
@@ -1000,7 +1009,7 @@ async def download_input_file(context, file_id, input_path):
 
 # ───────────────────────── conversion job ─────────────────────────
 
-async def run_job(update, context, filename=None, text=None):
+async def run_job(update, context, filename=None, text=None, settings=None):
     """Convert an uploaded file (filename) or pasted text (text) into audio."""
     message = update.effective_message
     uid = update.effective_user.id
@@ -1024,7 +1033,7 @@ async def run_job(update, context, filename=None, text=None):
         if len(text) > MAX_TEXT_CHARS:
             raise ValueError(f"Text exceeds {MAX_TEXT_CHARS:,} characters.")
 
-        s = cfg(uid).copy()
+        s = dict(settings) if settings else cfg(uid).copy()
         merged = await generate_audio(text, folder, s, status, uid, started)
         duration, size_bytes = await audio_metadata(merged)
         await safe_edit(status, progress_text(
@@ -1084,53 +1093,125 @@ async def run_job(update, context, filename=None, text=None):
         SKIPPED.pop(uid, None)
 
 
-def start_job(update, context, **kwargs):
-    """Run a conversion in the background so /status and /cancel stay responsive."""
+# ───────────────────────── per-user job queue ─────────────────────────
+
+def queue_size(uid):
+    """Running job (if any) + waiting jobs."""
+    return len(QUEUES.get(uid, [])) + (1 if uid in CURRENT else 0)
+
+
+async def queue_worker(uid):
+    """Process this user's jobs one at a time, in order."""
+    try:
+        while QUEUES.get(uid):
+            job = QUEUES[uid].pop(0)
+            CURRENT[uid] = job
+            task = asyncio.create_task(run_job(
+                job["update"], job["context"], filename=job["filename"],
+                text=job["text"], settings=job["settings"]))
+            TASKS[uid] = task
+            try:
+                await asyncio.wait({task})                  # doesn't raise if the job is cancelled
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+            finally:
+                TASKS.pop(uid, None)
+                CURRENT.pop(uid, None)
+            if not task.cancelled() and task.exception():
+                log.error("Job crashed", exc_info=task.exception())
+    finally:
+        if WORKERS.get(uid) is asyncio.current_task():
+            WORKERS.pop(uid, None)
+        if not QUEUES.get(uid):
+            QUEUES.pop(uid, None)
+
+
+async def enqueue(update, context, label, filename=None, text=None):
+    message = update.effective_message
     uid = update.effective_user.id
-    task = asyncio.create_task(run_job(update, context, **kwargs))
-    TASKS[uid] = task
-
-    def _done(t, uid=uid):
-        if TASKS.get(uid) is t:
-            TASKS.pop(uid, None)
-        if not t.cancelled() and t.exception():
-            log.error("Job crashed", exc_info=t.exception())
-
-    task.add_done_callback(_done)
-
-
-def busy(uid):
-    existing = TASKS.get(uid)
-    return bool(existing and not existing.done())
+    if queue_size(uid) >= MAX_QUEUE:
+        await message.reply_text(f"📋 Queue is full ({MAX_QUEUE} jobs). Wait for one to finish, or use /queue and /clearqueue.")
+        return
+    job = {
+        "update": update, "context": context, "filename": filename, "text": text,
+        "settings": cfg(uid).copy(),                         # voice/rate/etc. as set when queued
+        "label": label, "mid": message.message_id,
+    }
+    pending = QUEUES.setdefault(uid, [])
+    # Files sent together can be handled out of order; keep them in message order.
+    pos = len(pending)
+    while pos > 0 and pending[pos - 1]["mid"] > job["mid"]:
+        pos -= 1
+    pending.insert(pos, job)
+    number = pos + 1 + (1 if uid in CURRENT else 0)
+    if number == 1:
+        await message.reply_text(f"📋 Added: {label}\nStarting now.")
+    else:
+        await message.reply_text(f"📋 Queued #{number} of {queue_size(uid)}: {label}\nUse /queue to see the list.")
+    worker = WORKERS.get(uid)
+    if not worker or worker.done():
+        WORKERS[uid] = asyncio.create_task(queue_worker(uid))
 
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-    uid = update.effective_user.id
-    if busy(uid):
-        await message.reply_text("A conversion is already running. Use /status or /cancel.")
-        return
-
     filename = message.document.file_name or "input.txt"
     if Path(filename).suffix.lower() not in SUPPORTED_EXT:
-        await message.reply_text("Supported: TXT, MD, PDF, DOCX, EPUB.")
+        await message.reply_text(f"{filename}: unsupported. Supported: TXT, MD, PDF, DOCX, EPUB.")
         return
     if message.document.file_size and message.document.file_size > MAX_INPUT_MB * 1024 * 1024:
-        await message.reply_text(f"File exceeds configured {MAX_INPUT_MB} MB limit.")
+        await message.reply_text(f"{filename}: exceeds the {MAX_INPUT_MB} MB limit.")
         return
-    start_job(update, context, filename=filename)
+    await enqueue(update, context, filename[:60], filename=filename)
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-    uid = update.effective_user.id
     text = message.text or ""
     if not re.search(r"\w", text):
         return
-    if busy(uid):
-        await message.reply_text("A conversion is already running. Use /status or /cancel.")
+    snippet = " ".join(text.split())[:30]
+    await enqueue(update, context, f"Text “{snippet}…”", text=text)
+
+
+async def queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    running = CURRENT.get(uid)
+    pending = QUEUES.get(uid, [])
+    if not running and not pending:
+        await update.effective_message.reply_text("Queue is empty. Send up to "
+                                                  f"{MAX_QUEUE} files and they will be converted one by one.")
         return
-    start_job(update, context, text=text)
+    lines = [f"📋 Queue ({queue_size(uid)}/{MAX_QUEUE})"]
+    n = 1
+    if running:
+        lines.append(f"{n}. ▶️ {running['label']} — running")
+        n += 1
+    for job in pending:
+        lines.append(f"{n}. ⏳ {job['label']}")
+        n += 1
+    lines.append("\n/cancel — stop the running job (next one starts)\n/clearqueue — remove waiting jobs\n/cancelall — stop everything")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def clearqueue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    count = len(QUEUES.get(uid, []))
+    if count:
+        QUEUES[uid].clear()
+    await update.effective_message.reply_text(f"🧹 Removed {count} waiting job(s)." if count else "No waiting jobs.")
+
+
+async def cancelall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    count = len(QUEUES.get(uid, []))
+    if count:
+        QUEUES[uid].clear()
+    task = TASKS.get(uid)
+    if task and not task.done():
+        task.cancel()
+    await update.effective_message.reply_text(f"⛔ Cancelled the running job and removed {count} waiting job(s).")
 
 
 async def error_handler(update, context):
@@ -1171,6 +1252,9 @@ def main():
     app.add_handler(CommandHandler("demo", demo_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("queue", queue_cmd))
+    app.add_handler(CommandHandler("clearqueue", clearqueue_cmd))
+    app.add_handler(CommandHandler("cancelall", cancelall_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
