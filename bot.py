@@ -118,6 +118,7 @@ def demo_text_for(voice):
 SETTINGS = {}
 TASKS = {}
 PROGRESS = {}
+SKIPPED = {}
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -224,7 +225,10 @@ _CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]")
 def clean_text(text):
     text = re.sub(r"\r\n?", "\n", text)
     text = _CTRL.sub(" ", text)
-    text = text.replace("\u00ad", "")
+    # soft hyphen, zero-width space/marks, BOM, word joiner, bidi marks (keep ZWJ/ZWNJ for Indic scripts)
+    text = re.sub(r"[\u00ad\u200b\u200e\u200f\u2060\ufeff\u202a-\u202e]", "", text)
+    # emoji / pictographs / private-use symbols are unspeakable and can make Edge return no audio
+    text = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27bf\ue000-\uf8ff\ufe0f]", " ", text)
     text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)      # PDF hyphenation
     text = re.sub(r"[ \t\u00a0]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -295,10 +299,10 @@ async def run_ffmpeg(*args):
 
 # ───────────────────────── TTS engines ─────────────────────────
 
-async def make_edge(text, path, s):
+async def make_edge(text, path, s, attempts=3):
     """Retry transient Edge TTS failures and reject empty audio."""
     last_error = None
-    for attempt in range(1, 4):
+    for attempt in range(1, attempts + 1):
         try:
             path.unlink(missing_ok=True)
             tts = edge_tts.Communicate(
@@ -312,10 +316,10 @@ async def make_edge(text, path, s):
         except Exception as exc:
             last_error = exc
             path.unlink(missing_ok=True)
-            if attempt < 3:
+            if attempt < attempts:
                 await asyncio.sleep(attempt * 1.5)
     raise RuntimeError(
-        f"Edge TTS failed after 3 attempts ({type(last_error).__name__}: {last_error}). "
+        f"Edge TTS failed after {attempts} attempts ({type(last_error).__name__}: {last_error}). "
         "Try /engine google, or retry later if the TTS service is temporarily unavailable."
     ) from last_error
 
@@ -367,35 +371,53 @@ async def audio_metadata(path):
     return duration, size
 
 
-async def edge_with_split_fallback(chunk, out, folder, index, s):
-    """Try the whole chunk; on failure retry as two halves and join them."""
+async def make_silence(path, seconds=0.4):
+    """Short silent mp3 (matches Edge's 24 kHz mono 48 kbps) used for unspeakable fragments."""
+    code, err = await run_ffmpeg(
+        "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono", "-t", str(seconds),
+        "-c:a", "libmp3lame", "-b:a", "48k", "-y", str(path),
+    )
+    if code or not path.is_file():
+        raise RuntimeError("Could not create silence: " + err)
+
+
+async def edge_robust(text, out, folder, tag, s, skipped, depth=0):
+    """Speak `text`; if Edge returns no audio, split in halves and retry recursively.
+    A fragment that still cannot be spoken (symbols, page junk) becomes brief silence
+    so one bad piece never kills a whole audiobook."""
     try:
-        await make_edge(chunk, out, s)
+        await make_edge(text, out, s, attempts=2 if depth else 3)
         return
-    except Exception as first_error:
-        if len(chunk) < 500:
-            raise
-        log.warning("Edge TTS chunk %s failed; retrying in smaller pieces: %s", index + 1, first_error)
-        mid = len(chunk) // 2
-        cut = chunk.rfind(" ", 0, mid)
-        if cut < len(chunk) // 4:
-            cut = mid
-        subtexts = [t for t in (chunk[:cut].strip(), chunk[cut:].strip()) if re.search(r"\w", t)]
-        subpaths = []
-        try:
-            for j, subtext in enumerate(subtexts, 1):
-                subpath = folder / f"chunk_{index + 1:06d}_sub_{j}.mp3"
-                await make_edge(subtext, subpath, s)
-                subpaths.append(subpath)
-            sublist = folder / f"subconcat_{index + 1:06d}.txt"
-            sublist.write_text("".join(concat_line(x) for x in subpaths), encoding="utf-8")
-            code, suberr = await run_ffmpeg("-f", "concat", "-safe", "0", "-i", str(sublist), "-c", "copy", "-y", str(out))
-            sublist.unlink(missing_ok=True)
-            if code or not out.is_file() or out.stat().st_size <= 256:
-                raise RuntimeError("Edge TTS returned no audio even after splitting the failed chunk. " + suberr) from first_error
-        finally:
-            for sp in subpaths:
-                sp.unlink(missing_ok=True)
+    except Exception as exc:
+        if len(text) > 120 and depth < 6:
+            mid = len(text) // 2
+            cut = max(text.rfind(". ", 0, mid + 200), text.rfind("। ", 0, mid + 200), text.rfind(" ", 0, mid))
+            if cut < len(text) // 4 or cut > len(text) * 3 // 4:
+                cut = mid
+            parts = [t for t in (text[:cut].strip(), text[cut:].strip()) if t]
+            subpaths = []
+            try:
+                for j, part in enumerate(parts, 1):
+                    sp = folder / f"{tag}_{depth}_{j}.mp3"
+                    if re.search(r"\w", part):
+                        await edge_robust(part, sp, folder, f"{tag}_{depth}_{j}", s, skipped, depth + 1)
+                    else:
+                        await make_silence(sp)
+                    subpaths.append(sp)
+                lst = folder / f"{tag}_{depth}.txt"
+                lst.write_text("".join(concat_line(x) for x in subpaths), encoding="utf-8")
+                code, err = await run_ffmpeg("-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", "-y", str(out))
+                lst.unlink(missing_ok=True)
+                if code or not out.is_file() or out.stat().st_size <= 256:
+                    raise RuntimeError("Could not join split audio: " + err) from exc
+                return
+            finally:
+                for sp in subpaths:
+                    sp.unlink(missing_ok=True)
+        # Tiny fragment Edge refuses to speak: skip it with a short pause.
+        log.warning("Skipping unspeakable fragment (%s): %r", type(exc).__name__, text[:80])
+        skipped.append(text[:60])
+        await make_silence(out)
 
 
 async def generate_audio(text, folder, s, status, uid, started):
@@ -407,6 +429,8 @@ async def generate_audio(text, folder, s, status, uid, started):
     semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
     pieces = [folder / f"chunk_{i:06d}.mp3" for i in range(1, len(chunks) + 1)]
     state = {"done": 0, "bytes": 0, "last_edit": 0.0}
+    skipped = []
+    SKIPPED[uid] = skipped
     total = len(chunks)
     status_lock = asyncio.Lock()
     PROGRESS[uid] = {
@@ -420,7 +444,7 @@ async def generate_audio(text, folder, s, status, uid, started):
             if s["engine"] == "google":
                 await make_google(chunk, out, s)
             else:
-                await edge_with_split_fallback(chunk, out, folder, index, s)
+                await edge_robust(chunk, out, folder, f"c{index + 1:06d}", s, skipped)
 
             if not out.is_file() or out.stat().st_size <= 256:
                 raise RuntimeError(f"TTS produced no audio for chunk {index + 1}/{total}.")
@@ -1037,6 +1061,8 @@ async def run_job(update, context, filename=None, text=None):
             f"🎧 Audio duration: {fmt_time(duration)}\n"
             f"📦 Total audio size: {fmt_size(size_bytes)}\n"
             f"🎙️ Audio made: {len(parts)} file(s) sent."
+            + (f"\n⚠ {len(SKIPPED.get(uid, []))} unspeakable fragment(s) were skipped (symbols/junk text)."
+               if SKIPPED.get(uid) else "")
         )
     except asyncio.CancelledError:
         await safe_edit(status, "⛔ Conversion cancelled; clearing temporary files.")
@@ -1055,6 +1081,7 @@ async def run_job(update, context, filename=None, text=None):
     finally:
         shutil.rmtree(folder, ignore_errors=True)
         PROGRESS.pop(uid, None)
+        SKIPPED.pop(uid, None)
 
 
 def start_job(update, context, **kwargs):
