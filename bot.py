@@ -423,7 +423,11 @@ async def edge_robust(text, out, folder, tag, s, skipped, depth=0):
                     sp.unlink(missing_ok=True)
         # Tiny fragment Edge refuses to speak: skip it with a short pause.
         log.warning("Skipping unspeakable fragment (%s): %r", type(exc).__name__, text[:80])
-        skipped.append(text[:60])
+        try:
+            chunk_no = int(tag[1:7])
+        except ValueError:
+            chunk_no = 0
+        skipped.append({"chunk": chunk_no, "text": text[:200]})
         await make_silence(out)
 
 
@@ -437,8 +441,8 @@ async def generate_audio(text, folder, s, status, uid, started):
     pieces = [folder / f"chunk_{i:06d}.mp3" for i in range(1, len(chunks) + 1)]
     state = {"done": 0, "bytes": 0, "last_edit": 0.0}
     skipped = []
-    SKIPPED[uid] = skipped
     total = len(chunks)
+    SKIPPED[uid] = {"items": skipped, "total": total}
     status_lock = asyncio.Lock()
     PROGRESS[uid] = {
         "stage": "Generating audio", "done": 0, "total": total, "started": started,
@@ -1016,6 +1020,32 @@ async def download_input_file(context, file_id, input_path):
 
 # ───────────────────────── conversion job ─────────────────────────
 
+async def send_skipped_report(message, uid, duration):
+    """After the mp3 is sent, list every fragment that could not be spoken."""
+    info = SKIPPED.get(uid) or {}
+    items = sorted(info.get("items", []), key=lambda x: x["chunk"])
+    if not items:
+        return
+    total = max(1, info.get("total", 1))
+    lines = [f"⚠ {len(items)} fragment(s) were NOT spoken (0.4 s silence in their place).",
+             "Time is approximate position in the audio.\n"]
+    for n, item in enumerate(items, 1):
+        pos = fmt_time((item["chunk"] - 1) / total * duration) if item["chunk"] else "?"
+        shown = item["text"] if item["text"].strip() else "(blank / invisible characters)"
+        shown = " ".join(shown.split())[:150]
+        lines.append(f"{n}. ~{pos} · chunk {item['chunk']}/{total}\n   {shown}")
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 3800:
+            await message.reply_text(report)
+        else:
+            await message.reply_document(
+                document=report.encode("utf-8"), filename="skipped_fragments.txt",
+                caption=f"⚠ {len(items)} fragment(s) were not spoken — full list attached.")
+    except TelegramError:
+        log.exception("Could not send skipped-fragment report")
+
+
 async def run_job(update, context, filename=None, text=None, settings=None):
     """Convert an uploaded file (filename) or pasted text (text) into audio."""
     message = update.effective_message
@@ -1077,9 +1107,10 @@ async def run_job(update, context, filename=None, text=None, settings=None):
             f"🎧 Audio duration: {fmt_time(duration)}\n"
             f"📦 Total audio size: {fmt_size(size_bytes)}\n"
             f"🎙️ Audio made: {len(parts)} file(s) sent."
-            + (f"\n⚠ {len(SKIPPED.get(uid, []))} unspeakable fragment(s) were skipped (symbols/junk text)."
-               if SKIPPED.get(uid) else "")
+            + (f"\n⚠ {len(SKIPPED[uid]['items'])} unspeakable fragment(s) were skipped (list below)."
+               if SKIPPED.get(uid, {}).get("items") else "")
         )
+        await send_skipped_report(message, uid, duration)
     except asyncio.CancelledError:
         await safe_edit(status, "⛔ Conversion cancelled; clearing temporary files.")
         raise
