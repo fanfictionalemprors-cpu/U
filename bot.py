@@ -40,7 +40,7 @@ MAX_INPUT_MB = int(os.getenv("MAX_INPUT_MB", "1900" if LOCAL_BOT_API else "20"))
 SEND_PART_MB = int(os.getenv("SEND_PART_MB", "1800" if LOCAL_BOT_API else "45"))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "20000000"))
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "2500"))
-TTS_CONCURRENCY = max(1, min(8, int(os.getenv("TTS_CONCURRENCY", "6"))))
+TTS_CONCURRENCY = max(1, min(8, int(os.getenv("TTS_CONCURRENCY", "4"))))
 MAX_QUEUE = max(1, int(os.getenv("MAX_QUEUE", "8")))
 PROGRESS_EDIT_SECONDS =float(os.getenv("PROGRESS_EDIT_SECONDS", "3"))
 WORK_ROOT = Path(os.getenv("TTS_WORKDIR", "/tmp/telegram-tts-work"))
@@ -386,22 +386,44 @@ async def make_silence(path, seconds=0.4):
         raise RuntimeError("Could not create silence: " + err)
 
 
+def split_half(text):
+    """Split near the middle at a sentence end or a space — never inside a word
+    (cutting Hindi mid-word leaves broken letters that Edge refuses to read)."""
+    n = len(text)
+    mid = n // 2
+    best = None
+    for seps in (("।", ".", "!", "?", "\n"), (" ",)):
+        cands = []
+        for sep in seps:
+            for p in (text.rfind(sep, 0, mid + 1), text.find(sep, mid)):
+                if p > 0:
+                    cands.append(p + len(sep))
+        cands = [c for c in cands if n // 5 <= c <= n * 4 // 5]
+        if cands:
+            best = min(cands, key=lambda c: abs(c - mid))
+            break
+    if best is None:
+        return None
+    a, b = text[:best].strip(), text[best:].strip()
+    return (a, b) if a and b else None
+
+
+def devanagari_ratio(text):
+    letters = [c for c in text if c.isalpha()]
+    return sum(1 for c in letters if "ऀ" <= c <= "ॿ") / len(letters) if letters else 0.0
+
+
 async def edge_robust(text, out, folder, tag, s, skipped, depth=0):
-    """Speak `text`; if Edge returns no audio, split in halves and retry recursively.
-    A fragment that still cannot be spoken (symbols, page junk) becomes brief silence
-    so one bad piece never kills a whole audiobook."""
+    """Speak `text` with Edge. If Edge returns no audio: retry, split at a sentence/word
+    boundary and retry the halves, and as a last resort read the fragment with Google TTS.
+    Silence is used only if every engine fails, so no story text is silently dropped."""
     try:
-        # Fast path: one retry at the top level, a single try on split fragments,
-        # so a bad piece costs seconds, not minutes.
-        await make_edge(text, out, s, attempts=1 if depth else 2)
+        await make_edge(text, out, s, attempts=2 if depth else 3)
         return
     except Exception as exc:
-        if len(text) > 200 and depth < 4:
-            mid = len(text) // 2
-            cut = max(text.rfind(". ", 0, mid + 200), text.rfind("। ", 0, mid + 200), text.rfind(" ", 0, mid))
-            if cut < len(text) // 4 or cut > len(text) * 3 // 4:
-                cut = mid
-            parts = [t for t in (text[:cut].strip(), text[cut:].strip()) if t]
+        halves = split_half(text) if (len(text) > 120 and depth < 5) else None
+        if halves:
+            parts = list(halves)
             subpaths = []
             try:
                 for j, part in enumerate(parts, 1):
@@ -421,13 +443,24 @@ async def edge_robust(text, out, folder, tag, s, skipped, depth=0):
             finally:
                 for sp in subpaths:
                     sp.unlink(missing_ok=True)
-        # Tiny fragment Edge refuses to speak: skip it with a short pause.
-        log.warning("Skipping unspeakable fragment (%s): %r", type(exc).__name__, text[:80])
         try:
             chunk_no = int(tag[1:7])
         except ValueError:
             chunk_no = 0
-        skipped.append({"chunk": chunk_no, "text": text[:200]})
+        # Edge refuses this fragment: read it with Google TTS instead of dropping it.
+        try:
+            gs = dict(s)
+            if devanagari_ratio(text) > 0.5:
+                gs["voice"] = "hi-IN-MadhurNeural"      # only used to pick Google's language
+            await make_google(text, out, gs)
+            if out.is_file() and out.stat().st_size > 256:
+                log.warning("Edge failed (%s); fragment read with Google TTS: %r", type(exc).__name__, text[:60])
+                skipped.append({"chunk": chunk_no, "text": text[:200], "mode": "google"})
+                return
+        except Exception as gexc:
+            log.warning("Google fallback failed too: %s", gexc)
+        log.warning("Skipping unspeakable fragment (%s): %r", type(exc).__name__, text[:80])
+        skipped.append({"chunk": chunk_no, "text": text[:200], "mode": "silent"})
         await make_silence(out)
 
 
@@ -1023,7 +1056,8 @@ async def download_input_file(context, file_id, input_path):
 async def send_skipped_report(message, uid, duration):
     """After the mp3 is sent, list every fragment that could not be spoken."""
     info = SKIPPED.get(uid) or {}
-    items = sorted(info.get("items", []), key=lambda x: x["chunk"])
+    items = sorted((x for x in info.get("items", []) if x.get("mode", "silent") == "silent"),
+                   key=lambda x: x["chunk"])
     if not items:
         return
     total = max(1, info.get("total", 1))
@@ -1107,8 +1141,12 @@ async def run_job(update, context, filename=None, text=None, settings=None):
             f"🎧 Audio duration: {fmt_time(duration)}\n"
             f"📦 Total audio size: {fmt_size(size_bytes)}\n"
             f"🎙️ Audio made: {len(parts)} file(s) sent."
-            + (f"\n⚠ {len(SKIPPED[uid]['items'])} unspeakable fragment(s) were skipped (list below)."
-               if SKIPPED.get(uid, {}).get("items") else "")
+            + (lambda its: (
+                (f"\n🔁 {sum(1 for x in its if x.get('mode') == 'google')} fragment(s) Edge refused were read with Google voice."
+                 if any(x.get("mode") == "google" for x in its) else "")
+                + (f"\n⚠ {sum(1 for x in its if x.get('mode', 'silent') == 'silent')} fragment(s) could NOT be spoken (list below)."
+                   if any(x.get("mode", "silent") == "silent" for x in its) else "")
+            ))(SKIPPED.get(uid, {}).get("items", []))
         )
         await send_skipped_report(message, uid, duration)
     except asyncio.CancelledError:
