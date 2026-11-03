@@ -25,7 +25,10 @@ jobs:
       LOCAL_BOT_API_URL: "http://127.0.0.1:8081"
       LOCAL_API_CONTAINER: "telegram-bot-api"
       SEND_PART_MB: "1800"
-      TTS_CONCURRENCY: "3"
+      TTS_CONCURRENCY: "8"
+      CHUNK_CHARS: "1300"
+      DEFAULT_VOICE: "hi-IN-MadhurNeural"
+      DEFAULT_AUTO: "1"
       DEFAULT_RATE: "1.5"
 
     steps:
@@ -45,11 +48,12 @@ jobs:
           sudo apt-get install -y ffmpeg curl
           python -m pip install --upgrade pip
 
-      - name: Check Docker
+      - name: Pull Local Bot API image
         run: |
           set -e
           docker --version
-          sudo docker info
+          sudo docker info >/dev/null
+          sudo docker pull aiogram/telegram-bot-api:latest
 
       - name: Install Python dependencies
         run: |
@@ -109,14 +113,6 @@ jobs:
       - name: Run Telegram bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          TELEGRAM_API_ID: ${{ secrets.API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.API_HASH }}
-          LOCAL_BOT_API: "true"
-          LOCAL_BOT_API_URL: "http://127.0.0.1:8081"
-          LOCAL_API_CONTAINER: "telegram-bot-api"
-          SEND_PART_MB: "1800"
-          TTS_CONCURRENCY: "3"
-          DEFAULT_RATE: "1.5"
         run: |
           set -euo pipefail
           : "${BOT_TOKEN:?Missing BOT_TOKEN repository secret}"
