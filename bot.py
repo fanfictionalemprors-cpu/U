@@ -39,63 +39,177 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1900" if LOCAL_BOT_API else "50"
 MAX_INPUT_MB = int(os.getenv("MAX_INPUT_MB", "1900" if LOCAL_BOT_API else "20"))
 SEND_PART_MB = int(os.getenv("SEND_PART_MB", "1800" if LOCAL_BOT_API else "45"))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "20000000"))
-CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "2500"))
-TTS_CONCURRENCY = max(1, min(8, int(os.getenv("TTS_CONCURRENCY", "4"))))
+# Edge TTS splits anything above 4096 bytes into serial requests. Devanagari = 3 bytes/char,
+# so 1300 chars (~3900 bytes) is one request per chunk -> much better parallelism.
+CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "1300"))
+TTS_CONCURRENCY = max(1, min(16, int(os.getenv("TTS_CONCURRENCY", "8"))))
 MAX_QUEUE = max(1, int(os.getenv("MAX_QUEUE", "8")))
-PROGRESS_EDIT_SECONDS =float(os.getenv("PROGRESS_EDIT_SECONDS", "3"))
+PROGRESS_EDIT_SECONDS = float(os.getenv("PROGRESS_EDIT_SECONDS", "3"))
 WORK_ROOT = Path(os.getenv("TTS_WORKDIR", "/tmp/telegram-tts-work"))
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE", str(Path(__file__).resolve().parent / "bot_data" / "settings.json")))
 ALLOWED_USERS = {int(x) for x in re.findall(r"\d+", os.getenv("ALLOWED_USERS", ""))}
 
+DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "hi-IN-MadhurNeural")   # Hindi by default
 GTTS_SAMPLE_RATE = 24000          # gTTS mp3 output is 24 kHz
 EDGE_BYTES_PER_SEC = 6000         # Edge mp3 is 48 kbps -> used for cheap duration estimates
 SUPPORTED_EXT = {".txt", ".text", ".md", ".pdf", ".docx", ".epub"}
 
-# key -> (Edge short name, label)
-VOICES = {
-    # Hindi
-    "madhur": ("hi-IN-MadhurNeural", "🇮🇳 Hindi Male — Madhur"),
-    "swara": ("hi-IN-SwaraNeural", "🇮🇳 Hindi Female — Swara"),
-    # English (US)
-    "guy": ("en-US-GuyNeural", "🇺🇸 English Male — Guy"),
-    "jenny": ("en-US-JennyNeural", "🇺🇸 English Female — Jenny"),
-    "aria": ("en-US-AriaNeural", "🇺🇸 English Female — Aria"),
-    "ava": ("en-US-AvaNeural", "🇺🇸 English Female — Ava"),
-    "emma": ("en-US-EmmaNeural", "🇺🇸 English Female — Emma"),
-    "andrew": ("en-US-AndrewNeural", "🇺🇸 English Male — Andrew"),
-    "brian": ("en-US-BrianNeural", "🇺🇸 English Male — Brian"),
-    "christopher": ("en-US-ChristopherNeural", "🇺🇸 English Male — Christopher"),
-    # English (UK / India / Australia)
-    "ryan": ("en-GB-RyanNeural", "🇬🇧 English Male — Ryan"),
-    "sonia": ("en-GB-SoniaNeural", "🇬🇧 English Female — Sonia"),
-    "neerja": ("en-IN-NeerjaNeural", "🇮🇳 English Female — Neerja"),
-    "prabhat": ("en-IN-PrabhatNeural", "🇮🇳 English Male — Prabhat"),
-    "natasha": ("en-AU-NatashaNeural", "🇦🇺 English Female — Natasha"),
-    # Multilingual (read Hindi + English mixed text far better)
-    "avam": ("en-US-AvaMultilingualNeural", "🌐 Multilingual Female — Ava"),
-    "andrewm": ("en-US-AndrewMultilingualNeural", "🌐 Multilingual Male — Andrew"),
-    "emmam": ("en-US-EmmaMultilingualNeural", "🌐 Multilingual Female — Emma"),
-    "brianm": ("en-US-BrianMultilingualNeural", "🌐 Multilingual Male — Brian"),
-    # Other Indian languages
-    "bashkar": ("bn-IN-BashkarNeural", "🇮🇳 Bengali Male — Bashkar"),
-    "tanishaa": ("bn-IN-TanishaaNeural", "🇮🇳 Bengali Female — Tanishaa"),
-    "pallavi": ("ta-IN-PallaviNeural", "🇮🇳 Tamil Female — Pallavi"),
-    "valluvar": ("ta-IN-ValluvarNeural", "🇮🇳 Tamil Male — Valluvar"),
-    "mohan": ("te-IN-MohanNeural", "🇮🇳 Telugu Male — Mohan"),
-    "shruti": ("te-IN-ShrutiNeural", "🇮🇳 Telugu Female — Shruti"),
-    "aarohi": ("mr-IN-AarohiNeural", "🇮🇳 Marathi Female — Aarohi"),
-    "manohar": ("mr-IN-ManoharNeural", "🇮🇳 Marathi Male — Manohar"),
-    "dhwani": ("gu-IN-DhwaniNeural", "🇮🇳 Gujarati Female — Dhwani"),
-    "niranjan": ("gu-IN-NiranjanNeural", "🇮🇳 Gujarati Male — Niranjan"),
-    "sapna": ("kn-IN-SapnaNeural", "🇮🇳 Kannada Female — Sapna"),
-    "gagan": ("kn-IN-GaganNeural", "🇮🇳 Kannada Male — Gagan"),
-    "sobhana": ("ml-IN-SobhanaNeural", "🇮🇳 Malayalam Female — Sobhana"),
-    "midhun": ("ml-IN-MidhunNeural", "🇮🇳 Malayalam Male — Midhun"),
-    "gul": ("ur-IN-GulNeural", "🇮🇳 Urdu Female — Gul"),
-    "salman": ("ur-IN-SalmanNeural", "🇮🇳 Urdu Male — Salman"),
+# ───────────────────────── languages & voices ─────────────────────────
+
+# code -> (flag, English name)
+LANG_NAMES = {
+    "hi": ("🇮🇳", "Hindi"), "en": ("🇺🇸", "English"), "multi": ("🌐", "Multilingual"),
+    "bn": ("🇮🇳", "Bengali"), "ta": ("🇮🇳", "Tamil"), "te": ("🇮🇳", "Telugu"),
+    "mr": ("🇮🇳", "Marathi"), "gu": ("🇮🇳", "Gujarati"), "kn": ("🇮🇳", "Kannada"),
+    "ml": ("🇮🇳", "Malayalam"), "ur": ("🇮🇳", "Urdu"), "ne": ("🇳🇵", "Nepali"),
+    "fr": ("🇫🇷", "French"), "es": ("🇪🇸", "Spanish"), "de": ("🇩🇪", "German"),
+    "pt": ("🇧🇷", "Portuguese"), "it": ("🇮🇹", "Italian"), "ru": ("🇷🇺", "Russian"),
+    "ja": ("🇯🇵", "Japanese"), "zh": ("🇨🇳", "Chinese"), "ko": ("🇰🇷", "Korean"),
+    "ar": ("🇸🇦", "Arabic"),
 }
+LANG_ORDER = list(LANG_NAMES)
+REGION_FLAGS = {
+    "IN": "🇮🇳", "US": "🇺🇸", "GB": "🇬🇧", "AU": "🇦🇺", "NP": "🇳🇵", "FR": "🇫🇷", "ES": "🇪🇸",
+    "DE": "🇩🇪", "BR": "🇧🇷", "IT": "🇮🇹", "RU": "🇷🇺", "JP": "🇯🇵", "CN": "🇨🇳", "KR": "🇰🇷", "SA": "🇸🇦",
+}
+
+# key, Edge voice, gender, display name
+_VOICE_TABLE = [
+    # Hindi
+    ("madhur", "hi-IN-MadhurNeural", "M", "Madhur"),
+    ("swara", "hi-IN-SwaraNeural", "F", "Swara"),
+    # English
+    ("guy", "en-US-GuyNeural", "M", "Guy"),
+    ("jenny", "en-US-JennyNeural", "F", "Jenny"),
+    ("aria", "en-US-AriaNeural", "F", "Aria"),
+    ("ava", "en-US-AvaNeural", "F", "Ava"),
+    ("emma", "en-US-EmmaNeural", "F", "Emma"),
+    ("michelle", "en-US-MichelleNeural", "F", "Michelle"),
+    ("andrew", "en-US-AndrewNeural", "M", "Andrew"),
+    ("brian", "en-US-BrianNeural", "M", "Brian"),
+    ("christopher", "en-US-ChristopherNeural", "M", "Christopher"),
+    ("roger", "en-US-RogerNeural", "M", "Roger"),
+    ("ryan", "en-GB-RyanNeural", "M", "Ryan"),
+    ("thomas", "en-GB-ThomasNeural", "M", "Thomas"),
+    ("sonia", "en-GB-SoniaNeural", "F", "Sonia"),
+    ("libby", "en-GB-LibbyNeural", "F", "Libby"),
+    ("neerja", "en-IN-NeerjaNeural", "F", "Neerja"),
+    ("prabhat", "en-IN-PrabhatNeural", "M", "Prabhat"),
+    ("natasha", "en-AU-NatashaNeural", "F", "Natasha"),
+    ("william", "en-AU-WilliamNeural", "M", "William"),
+    # Multilingual (read mixed-language text far better)
+    ("avam", "en-US-AvaMultilingualNeural", "F", "Ava"),
+    ("andrewm", "en-US-AndrewMultilingualNeural", "M", "Andrew"),
+    ("emmam", "en-US-EmmaMultilingualNeural", "F", "Emma"),
+    ("brianm", "en-US-BrianMultilingualNeural", "M", "Brian"),
+    ("vivienne", "fr-FR-VivienneMultilingualNeural", "F", "Vivienne"),
+    ("remy", "fr-FR-RemyMultilingualNeural", "M", "Remy"),
+    ("seraphina", "de-DE-SeraphinaMultilingualNeural", "F", "Seraphina"),
+    ("florian", "de-DE-FlorianMultilingualNeural", "M", "Florian"),
+    # Other Indian languages
+    ("bashkar", "bn-IN-BashkarNeural", "M", "Bashkar"),
+    ("tanishaa", "bn-IN-TanishaaNeural", "F", "Tanishaa"),
+    ("pallavi", "ta-IN-PallaviNeural", "F", "Pallavi"),
+    ("valluvar", "ta-IN-ValluvarNeural", "M", "Valluvar"),
+    ("mohan", "te-IN-MohanNeural", "M", "Mohan"),
+    ("shruti", "te-IN-ShrutiNeural", "F", "Shruti"),
+    ("aarohi", "mr-IN-AarohiNeural", "F", "Aarohi"),
+    ("manohar", "mr-IN-ManoharNeural", "M", "Manohar"),
+    ("dhwani", "gu-IN-DhwaniNeural", "F", "Dhwani"),
+    ("niranjan", "gu-IN-NiranjanNeural", "M", "Niranjan"),
+    ("sapna", "kn-IN-SapnaNeural", "F", "Sapna"),
+    ("gagan", "kn-IN-GaganNeural", "M", "Gagan"),
+    ("sobhana", "ml-IN-SobhanaNeural", "F", "Sobhana"),
+    ("midhun", "ml-IN-MidhunNeural", "M", "Midhun"),
+    ("gul", "ur-IN-GulNeural", "F", "Gul"),
+    ("salman", "ur-IN-SalmanNeural", "M", "Salman"),
+    ("hemkala", "ne-NP-HemkalaNeural", "F", "Hemkala"),
+    ("sagar", "ne-NP-SagarNeural", "M", "Sagar"),
+    # World languages
+    ("denise", "fr-FR-DeniseNeural", "F", "Denise"),
+    ("henri", "fr-FR-HenriNeural", "M", "Henri"),
+    ("elvira", "es-ES-ElviraNeural", "F", "Elvira"),
+    ("alvaro", "es-ES-AlvaroNeural", "M", "Alvaro"),
+    ("katja", "de-DE-KatjaNeural", "F", "Katja"),
+    ("conrad", "de-DE-ConradNeural", "M", "Conrad"),
+    ("francisca", "pt-BR-FranciscaNeural", "F", "Francisca"),
+    ("antonio", "pt-BR-AntonioNeural", "M", "Antonio"),
+    ("elsa", "it-IT-ElsaNeural", "F", "Elsa"),
+    ("diego", "it-IT-DiegoNeural", "M", "Diego"),
+    ("svetlana", "ru-RU-SvetlanaNeural", "F", "Svetlana"),
+    ("dmitry", "ru-RU-DmitryNeural", "M", "Dmitry"),
+    ("nanami", "ja-JP-NanamiNeural", "F", "Nanami"),
+    ("keita", "ja-JP-KeitaNeural", "M", "Keita"),
+    ("xiaoxiao", "zh-CN-XiaoxiaoNeural", "F", "Xiaoxiao"),
+    ("yunxi", "zh-CN-YunxiNeural", "M", "Yunxi"),
+    ("sunhi", "ko-KR-SunHiNeural", "F", "SunHi"),
+    ("injoon", "ko-KR-InJoonNeural", "M", "InJoon"),
+    ("zariyah", "ar-SA-ZariyahNeural", "F", "Zariyah"),
+    ("hamed", "ar-SA-HamedNeural", "M", "Hamed"),
+]
 VOICE_PATTERN = re.compile(r"^[a-z]{2,3}-[A-Z]{2}-[A-Za-z]+Neural$")
+
+
+def lang_of(voice):
+    """'hi-IN-MadhurNeural' -> 'hi'; any *MultilingualNeural voice -> 'multi'."""
+    if "Multilingual" in voice:
+        return "multi"
+    return voice.split("-", 1)[0].lower()
+
+
+def _build_voices():
+    voices, genders = {}, {}
+    for key, name, gender, short in _VOICE_TABLE:
+        lang = lang_of(name)
+        parts = name.split("-")
+        flag = "🌐" if lang == "multi" else REGION_FLAGS.get(parts[1] if len(parts) > 1 else "", "🌐")
+        label = f"{flag} {LANG_NAMES.get(lang, ('', lang))[1]} {'Female' if gender == 'F' else 'Male'} — {short}"
+        voices[key] = (name, label)
+        genders[name] = gender
+    return voices, genders
+
+
+VOICES, VOICE_GENDER = _build_voices()
+# Indian English is the natural companion of a Hindi voice, so prefer it over US English.
+LANG_PREF = {("en", "M"): "en-IN-PrabhatNeural", ("en", "F"): "en-IN-NeerjaNeural"}
+
+
+def gender_of(voice):
+    return VOICE_GENDER.get(voice, "M")
+
+
+def voice_for_lang(lang, gender="M"):
+    pref = LANG_PREF.get((lang, gender))
+    if pref:
+        return pref
+    first_any = None
+    for name, _ in VOICES.values():
+        if lang_of(name) != lang:
+            continue
+        if VOICE_GENDER[name] == gender:
+            return name
+        first_any = first_any or name
+    return first_any
+
+
+def voices_of_lang(lang):
+    return [(k, n, l) for k, (n, l) in VOICES.items() if lang_of(n) == lang]
+
+
+def voice_label(voice):
+    return next((v[1] for v in VOICES.values() if v[0] == voice), voice)
+
+
+def resolve_voice(arg):
+    key = arg.lower()
+    if key in VOICES:
+        return VOICES[key][0]
+    if VOICE_PATTERN.match(arg):
+        return arg
+    return None
+
+
 DEMO_TEXT = {
     "hi": "नमस्ते! मैं आपकी ऑडियोबुक पढ़ने के लिए तैयार हूँ। यह मेरी आवाज़ का एक छोटा सा डेमो है।",
     "en": "Hello! I'm ready to read your audiobook. This is a short demo of my voice.",
@@ -107,19 +221,84 @@ DEMO_TEXT = {
     "kn": "ನಮಸ್ಕಾರ! ನಿಮ್ಮ ಆಡಿಯೋಬುಕ್ ಓದಲು ನಾನು ಸಿದ್ಧ. ಇದು ನನ್ನ ಧ್ವನಿಯ ಒಂದು ಚಿಕ್ಕ ಡೆಮೊ.",
     "ml": "നമസ്കാരം! നിങ്ങളുടെ ഓഡിയോബുക്ക് വായിക്കാൻ ഞാൻ തയ്യാറാണ്. ഇത് എന്റെ ശബ്ദത്തിന്റെ ഒരു ചെറിയ ഡെമോ ആണ്.",
     "ur": "السلام علیکم! میں آپ کی آڈیو بک پڑھنے کے لیے تیار ہوں۔ یہ میری آواز کا ایک مختصر ڈیمو ہے۔",
+    "ne": "नमस्ते! म तपाईंको अडियोबुक पढ्न तयार छु। यो मेरो आवाजको छोटो डेमो हो।",
+    "fr": "Bonjour ! Je suis prêt à lire votre livre audio. Voici un court aperçu de ma voix.",
+    "es": "¡Hola! Estoy listo para leer tu audiolibro. Esta es una breve demostración de mi voz.",
+    "de": "Hallo! Ich bin bereit, Ihr Hörbuch vorzulesen. Das ist eine kurze Hörprobe meiner Stimme.",
+    "pt": "Olá! Estou pronto para ler o seu audiolivro. Esta é uma breve demonstração da minha voz.",
+    "it": "Ciao! Sono pronto a leggere il tuo audiolibro. Questa è una breve dimostrazione della mia voce.",
+    "ru": "Здравствуйте! Я готов прочитать вашу аудиокнигу. Это короткая демонстрация моего голоса.",
+    "ja": "こんにちは！あなたのオーディオブックを読む準備ができています。これは私の声の短いデモです。",
+    "zh": "你好！我已经准备好为你朗读有声书了。这是我声音的简短演示。",
+    "ko": "안녕하세요! 오디오북을 읽을 준비가 되었습니다. 제 목소리의 짧은 데모입니다.",
+    "ar": "مرحبًا! أنا جاهز لقراءة كتابك الصوتي. هذا عرض قصير لصوتي.",
 }
-MULTI_DEMO = ("नमस्ते! Hello! I can read Hindi and English together. यह मेरी आवाज़ का डेमो है।")
+MULTI_DEMO = "नमस्ते! Hello! I can read Hindi and English together. यह मेरी आवाज़ का डेमो है।"
 
 
 def demo_text_for(voice):
-    if "Multilingual" in voice:
+    lang = lang_of(voice)
+    if lang == "multi":
         return MULTI_DEMO
-    return DEMO_TEXT.get(voice.split("-", 1)[0].lower(), DEMO_TEXT["en"])
+    return DEMO_TEXT.get(lang, DEMO_TEXT["en"])
+
+
+# ── script detection (auto language) ──
+_SCRIPT_RANGES = [
+    ("deva", 0x0900, 0x097F), ("beng", 0x0980, 0x09FF), ("gujr", 0x0A80, 0x0AFF),
+    ("taml", 0x0B80, 0x0BFF), ("telu", 0x0C00, 0x0C7F), ("knda", 0x0C80, 0x0CFF),
+    ("mlym", 0x0D00, 0x0D7F), ("arab", 0x0600, 0x06FF), ("cyrl", 0x0400, 0x04FF),
+    ("cjk", 0x3040, 0x30FF), ("cjk", 0x4E00, 0x9FFF), ("hang", 0xAC00, 0xD7AF),
+]
+# script -> (languages whose voices can read it, language to switch to)
+_SCRIPT_LANGS = {
+    "deva": ({"hi", "mr", "ne"}, "hi"), "beng": ({"bn"}, "bn"), "gujr": ({"gu"}, "gu"),
+    "taml": ({"ta"}, "ta"), "telu": ({"te"}, "te"), "knda": ({"kn"}, "kn"),
+    "mlym": ({"ml"}, "ml"), "arab": ({"ar", "ur"}, "ur"), "cyrl": ({"ru"}, "ru"),
+    "cjk": ({"zh", "ja"}, "zh"), "hang": ({"ko"}, "ko"),
+    "latn": ({"en", "fr", "es", "de", "pt", "it"}, "en"),
+}
+
+
+def auto_voice(text, voice, threshold=0.7):
+    """If a chunk is clearly written in a script the current voice can't read
+    (e.g. an English paragraph inside a Hindi book), pick a matching voice with the
+    same gender. Mixed chunks and Multilingual voices are left untouched."""
+    if "Multilingual" in voice:
+        return voice
+    counts, kana, total = {}, 0, 0
+    for ch in text[:1500]:
+        if not ch.isalpha():
+            continue
+        cp = ord(ch)
+        total += 1
+        if cp < 0x250:
+            counts["latn"] = counts.get("latn", 0) + 1
+            continue
+        for name, lo, hi in _SCRIPT_RANGES:
+            if lo <= cp <= hi:
+                counts[name] = counts.get(name, 0) + 1
+                if 0x3040 <= cp <= 0x30FF:
+                    kana += 1
+                break
+    if not total or not counts:
+        return voice
+    script, n = max(counts.items(), key=lambda kv: kv[1])
+    if n / total < threshold:
+        return voice
+    compatible, target = _SCRIPT_LANGS[script]
+    if lang_of(voice) in compatible:
+        return voice
+    if script == "cjk" and kana:
+        target = "ja"
+    return voice_for_lang(target, gender_of(voice)) or voice
+
 
 SETTINGS = {}
 TASKS = {}
 PROGRESS = {}
 SKIPPED = {}
+LANGSTAT = {}   # uid -> {lang: chunks}
 QUEUES = {}     # uid -> waiting jobs
 CURRENT = {}    # uid -> running job
 WORKERS = {}    # uid -> queue worker task
@@ -189,11 +368,12 @@ def save_settings():
 
 def cfg(uid):
     s = SETTINGS.setdefault(uid, {})
-    s.setdefault("voice", os.getenv("DEFAULT_VOICE", "hi-IN-MadhurNeural"))
+    s.setdefault("voice", DEFAULT_VOICE)
     s.setdefault("rate", float(os.getenv("DEFAULT_RATE", "1.1")))
     s.setdefault("pitch", int(os.getenv("DEFAULT_PITCH", "0")))
     s.setdefault("engine", os.getenv("DEFAULT_ENGINE", "edge").lower())
     s.setdefault("name", "Audiobook")
+    s.setdefault("auto", os.getenv("DEFAULT_AUTO", "1").lower() in {"1", "true", "yes", "on"})
     return s
 
 
@@ -210,10 +390,6 @@ def safe_name(value):
 
 def edge_rate(rate):
     return f"{round((rate - 1.0) * 100):+d}%"
-
-
-def voice_label(voice):
-    return next((v[1] for v in VOICES.values() if v[0] == voice), voice)
 
 
 async def safe_edit(target, text, markup=None):
@@ -261,15 +437,21 @@ def extract_text(path):
     raise ValueError("Supported formats: TXT, MD, PDF, DOCX, EPUB.")
 
 
+def _mostly_ascii(seg):
+    return bool(seg) and sum(1 for c in seg if c < "\x80") > 0.85 * len(seg)
+
+
 def split_text(text, limit=CHUNK_CHARS):
-    """Index-based splitter (linear time) that keeps sentence punctuation."""
+    """Index-based splitter (linear time) that keeps sentence punctuation.
+    ASCII-heavy (Latin) text takes 1 byte/char, so those chunks are made 2x longer."""
     text = clean_text(text)
     n = len(text)
     i = 0
     chunks = []
     groups = (("\n",), ("। ", ". ", "! ", "? ", "।\n", ".\n"), ("; ", ", ", " "))
     while i < n:
-        end = min(n, i + limit)
+        lim = limit * 2 if _mostly_ascii(text[i:i + limit]) else limit
+        end = min(n, i + lim)
         cut = end
         if end < n:
             window = text[i:end]
@@ -277,7 +459,7 @@ def split_text(text, limit=CHUNK_CHARS):
                 best = -1
                 for sep in group:
                     p = window.rfind(sep)
-                    if p >= limit // 2:
+                    if p >= lim // 2:
                         best = max(best, p + max(1, len(sep.rstrip())))
                 if best > 0:
                     cut = i + best
@@ -329,18 +511,27 @@ async def make_edge(text, path, s, attempts=3):
     ) from last_error
 
 
+def devanagari_ratio(text):
+    letters = [c for c in text if c.isalpha()]
+    return sum(1 for c in letters if "ऀ" <= c <= "ॿ") / len(letters) if letters else 0.0
+
+
 def google_lang(voice):
-    lang = voice.split("-", 1)[0].lower()
-    tld = "co.in" if voice.startswith(("en-IN", "hi-", "bn-", "ta-", "te-", "mr-", "gu-", "kn-", "ml-", "ur-")) else "com"
-    if voice.startswith("en-GB"):
-        tld = "co.uk"
-    elif voice.startswith("en-AU"):
-        tld = "com.au"
+    lang = lang_of(voice)
+    if lang == "multi":
+        lang = "en"
+    parts = voice.split("-")
+    region = parts[1] if len(parts) > 1 else ""
+    tld = {"IN": "co.in", "GB": "co.uk", "AU": "com.au"}.get(region, "com")
+    if lang == "zh":
+        lang = "zh-CN"
     return lang, tld
 
 
 async def make_google(text, path, s):
     lang, tld = google_lang(s["voice"])
+    if lang_of(s["voice"]) == "multi" and devanagari_ratio(text) > 0.5:
+        lang, tld = "hi", "co.in"
     await asyncio.to_thread(gTTS(text=text, lang=lang, tld=tld, slow=False).save, str(path))
     # Google TTS has no native rate/pitch controls -> FFmpeg post-processing.
     if s["rate"] != 1.0 or s["pitch"] != 0:
@@ -408,11 +599,6 @@ def split_half(text):
     return (a, b) if a and b else None
 
 
-def devanagari_ratio(text):
-    letters = [c for c in text if c.isalpha()]
-    return sum(1 for c in letters if "ऀ" <= c <= "ॿ") / len(letters) if letters else 0.0
-
-
 async def edge_robust(text, out, folder, tag, s, skipped, depth=0):
     """Speak `text` with Edge. If Edge returns no audio: retry, split at a sentence/word
     boundary and retry the halves, and as a last resort read the fragment with Google TTS.
@@ -474,8 +660,10 @@ async def generate_audio(text, folder, s, status, uid, started):
     pieces = [folder / f"chunk_{i:06d}.mp3" for i in range(1, len(chunks) + 1)]
     state = {"done": 0, "bytes": 0, "last_edit": 0.0}
     skipped = []
+    langstat = {}
     total = len(chunks)
     SKIPPED[uid] = {"items": skipped, "total": total}
+    LANGSTAT[uid] = langstat
     status_lock = asyncio.Lock()
     PROGRESS[uid] = {
         "stage": "Generating audio", "done": 0, "total": total, "started": started,
@@ -484,11 +672,18 @@ async def generate_audio(text, folder, s, status, uid, started):
 
     async def generate_one(index, chunk):
         out = pieces[index]
+        cs = s
+        if s.get("auto"):
+            v = auto_voice(chunk, s["voice"])
+            if v != s["voice"]:
+                cs = {**s, "voice": v}
+        lang = lang_of(cs["voice"])
+        langstat[lang] = langstat.get(lang, 0) + 1
         async with semaphore:
-            if s["engine"] == "google":
-                await make_google(chunk, out, s)
+            if cs["engine"] == "google":
+                await make_google(chunk, out, cs)
             else:
-                await edge_robust(chunk, out, folder, f"c{index + 1:06d}", s, skipped)
+                await edge_robust(chunk, out, folder, f"c{index + 1:06d}", cs, skipped)
 
             if not out.is_file() or out.stat().st_size <= 256:
                 raise RuntimeError(f"TTS produced no audio for chunk {index + 1}/{total}.")
@@ -518,7 +713,7 @@ async def generate_audio(text, folder, s, status, uid, started):
                     BG_TASKS.add(edit_task)
                     edit_task.add_done_callback(BG_TASKS.discard)
 
-    tasks =[asyncio.create_task(generate_one(i, chunk)) for i, chunk in enumerate(chunks)]
+    tasks = [asyncio.create_task(generate_one(i, chunk)) for i, chunk in enumerate(chunks)]
     try:
         await asyncio.gather(*tasks)
     except BaseException:
@@ -574,18 +769,21 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "🎧 TTS Bot ready!\nSend TXT, MD, PDF, DOCX or EPUB — or just type/paste text.\n"
-        "Use /settings for voice, rate, pitch and filename, or /voices to see every voice."
+        "🎧 TTS Bot ready! (default: Hindi — Madhur)\n"
+        "Send TXT, MD, PDF, DOCX or EPUB — or just type/paste text.\n"
+        "Use /settings for voice, language, rate, pitch and filename, or /voices to see every voice."
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "/start — Start\n/help — Help\n/settings — Settings menu\n"
-        "/voice <name> — Set voice (or /voice for a menu)\n/voices — List all voices\n"
+        "/lang [code] — Pick language (e.g. /lang hi, /lang en, /lang fr)\n"
+        "/auto on|off — Auto-switch voice when a paragraph is in another language\n"
+        "/voice <name> — Set voice (or /voice for a menu)\n/voices [lang] — List voices (e.g. /voices hi)\n"
         "/rate 1.5 — Rate (0.5–2.0)\n/speed 1.5 — Rate alias\n"
         "/pitch 5 — Pitch (-20 to +20 Hz)\n/engine edge|google — Engine\n"
-        "/name My Audiobook — Output filename\n/demo [voice|all] — Voice demo\n"
+        "/name My Audiobook — Output filename\n/demo [voice|lang|all] — Voice demo\n"
         "/status — Progress\n/queue — Show queue\n/cancel — Cancel running job\n"
         "/clearqueue — Remove waiting jobs\n/cancelall — Cancel everything\n\n"
         f"Send a file, or plain text, to convert it. You can send up to {MAX_QUEUE} files at once; "
@@ -594,10 +792,24 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def voices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = [f"/voice {key} — {label}" for key, (_, label) in VOICES.items()]
-    text = ("🎙️ Available voices\n\n" + "\n".join(lines)
-            + "\n\nHear one: /demo <name> (e.g. /demo madhur) · all: /demo all"
-            + "\nYou can also pass any full Edge name, e.g. /voice fr-FR-DeniseNeural")
+    only = context.args[0].lower() if context.args else None
+    if only and only not in LANG_NAMES:
+        await update.effective_message.reply_text(
+            "Unknown language. Codes: " + ", ".join(LANG_ORDER))
+        return
+    lines = []
+    for lang in LANG_ORDER:
+        if only and lang != only:
+            continue
+        vs = voices_of_lang(lang)
+        if not vs:
+            continue
+        flag, name = LANG_NAMES[lang]
+        lines.append(f"\n{flag} {name} ({lang})")
+        lines += [f"/voice {k} — {l}" for k, _, l in vs]
+    text = ("🎙️ Available voices" + "\n".join([""] + lines)
+            + "\n\nHear one: /demo <name> · a whole language: /demo hi · all: /demo all"
+            + "\nAny full Edge name also works, e.g. /voice fr-CA-SylvieNeural")
     for i in range(0, len(text), 3900):                # Telegram limit is 4096 chars
         await update.effective_message.reply_text(text[i:i + 3900])
 
@@ -607,30 +819,40 @@ def settings_text(uid):
     return (
         "⚙️ TTS Settings\n\n"
         f"Voice: {voice_label(s['voice'])}\nRate: {s['rate']:.2f}x\nPitch: {s['pitch']:+d} Hz\n"
-        f"Engine: {s['engine']}\nAudio name: {s['name']}"
+        f"Engine: {s['engine']}\nAuto language switch: {'ON' if s['auto'] else 'OFF'}\n"
+        f"Audio name: {s['name']}"
     )
 
 
 def settings_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Voice", callback_data="menu:voice"),
-         InlineKeyboardButton("Rate", callback_data="menu:rate")],
-        [InlineKeyboardButton("Pitch", callback_data="menu:pitch"),
-         InlineKeyboardButton("Engine", callback_data="menu:engine")],
-        [InlineKeyboardButton("Audio name help", callback_data="menu:name"),
-         InlineKeyboardButton("Refresh", callback_data="menu:refresh")],
+        [InlineKeyboardButton("🌐 Voice / Language", callback_data="menu:voice"),
+         InlineKeyboardButton("🔀 Auto language", callback_data="auto:toggle")],
+        [InlineKeyboardButton("Rate", callback_data="menu:rate"),
+         InlineKeyboardButton("Pitch", callback_data="menu:pitch")],
+        [InlineKeyboardButton("Engine", callback_data="menu:engine"),
+         InlineKeyboardButton("Audio name help", callback_data="menu:name")],
+        [InlineKeyboardButton("Refresh", callback_data="menu:refresh")],
     ])
 
 
-def voice_keyboard():
+def lang_keyboard():
+    buttons = [InlineKeyboardButton(f"{LANG_NAMES[l][0]} {LANG_NAMES[l][1]}", callback_data=f"vl:{l}")
+               for l in LANG_ORDER]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("⬅ Back", callback_data="menu:refresh")])
+    return InlineKeyboardMarkup(rows)
+
+
+def voice_keyboard(lang):
     # One row per voice: [select voice] [🔊 hear demo]
     rows = [
         [InlineKeyboardButton(label, callback_data=f"voice:{key}"),
          InlineKeyboardButton("🔊 Demo", callback_data=f"demo:{key}")]
-        for key, (_, label) in VOICES.items()
+        for key, _, label in voices_of_lang(lang)
     ]
-    rows.append([InlineKeyboardButton("🔊 Demo ALL voices", callback_data="demo:all")])
-    rows.append([InlineKeyboardButton("⬅ Back", callback_data="menu:refresh")])
+    rows.append([InlineKeyboardButton(f"🔊 Demo all {LANG_NAMES[lang][1]}", callback_data=f"demol:{lang}")])
+    rows.append([InlineKeyboardButton("⬅ Languages", callback_data="menu:voice")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -640,23 +862,56 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def lang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    s = cfg(uid)
+    if not context.args:
+        await update.effective_message.reply_text(
+            "🌐 Choose language (or /lang hi, /lang en …):", reply_markup=lang_keyboard())
+        return
+    code = context.args[0].lower()
+    if code not in LANG_NAMES:
+        await update.effective_message.reply_text("Unknown language. Codes: " + ", ".join(LANG_ORDER))
+        return
+    voice = voice_for_lang(code, gender_of(s["voice"]))
+    if not voice:
+        await update.effective_message.reply_text("No voice available for that language.")
+        return
+    s["voice"] = voice
+    save_settings()
+    await update.effective_message.reply_text(f"Voice set: {voice_label(voice)}\nChange it with /voices {code}")
+
+
+async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = cfg(update.effective_user.id)
+    if context.args:
+        v = context.args[0].lower()
+        if v in {"on", "1", "yes"}:
+            s["auto"] = True
+        elif v in {"off", "0", "no"}:
+            s["auto"] = False
+        else:
+            await update.effective_message.reply_text("Use /auto on or /auto off.")
+            return
+        save_settings()
+    await update.effective_message.reply_text(
+        f"Auto language switch: {'ON' if s['auto'] else 'OFF'}\n"
+        "ON = a paragraph written in a different script (e.g. English inside a Hindi book) "
+        "is read by a matching voice of the same gender. Multilingual voices are never switched.")
+
+
 async def voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if context.args:
-        arg = context.args[0]
-        key = arg.lower()
-        if key in VOICES:
-            cfg(uid)["voice"] = VOICES[key][0]
-            save_settings()
-            await update.effective_message.reply_text(f"Voice set: {VOICES[key][1]}")
-        elif VOICE_PATTERN.match(arg):
-            cfg(uid)["voice"] = arg
-            save_settings()
-            await update.effective_message.reply_text(f"Voice set: {arg}")
-        else:
+        voice = resolve_voice(context.args[0])
+        if not voice:
             await update.effective_message.reply_text("Unknown voice. Use /voices to see the list.")
+            return
+        cfg(uid)["voice"] = voice
+        save_settings()
+        await update.effective_message.reply_text(f"Voice set: {voice_label(voice)}")
         return
-    await update.effective_message.reply_text("Choose voice:", reply_markup=voice_keyboard())
+    await update.effective_message.reply_text("Choose language:", reply_markup=lang_keyboard())
 
 
 async def rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -724,7 +979,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not task or task.done():
         await update.effective_message.reply_text("No active conversion.")
     elif p:
-        extra = f"📋 Queue: job 1 of {queue_size(update.effective_user.id)} — {CURRENT.get(update.effective_user.id, {}).get('label', '')}\n"
+        extra = f"📋 Queue: job 1 of {queue_size(uid)} — {CURRENT.get(uid, {}).get('label', '')}\n"
         if p.get("audio_duration") is not None:
             extra += (f"🎧 Audio duration made: ~{fmt_time(p.get('audio_duration', 0))}\n"
                       f"📦 Generated audio size: {fmt_size(p.get('audio_bytes', 0))}\n"
@@ -747,78 +1002,60 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + (f"\nNext in queue starts automatically ({waiting} waiting). Use /cancelall to stop everything." if waiting else ""))
 
 
-async def send_demo(message, uid, voice):
-    """Synthesize and send a demo of one voice using the user's rate/pitch/engine."""
+# ───────────────────────── demos ─────────────────────────
+
+async def demo_bytes(uid, voice):
+    """Synthesize a short demo of one voice with the user's rate/pitch/engine."""
     folder = Path(tempfile.mkdtemp(prefix="tts-demo-", dir=WORK_ROOT))
     try:
         s = cfg(uid).copy()
         s["voice"] = voice
-        output = folder / f"demo_{safe_name(voice)}.mp3"
+        out = folder / f"demo_{safe_name(voice)}.mp3"
         text = demo_text_for(voice)
         if s["engine"] == "google":
-            await make_google(text, output, s)
+            await make_google(text, out, s)
         else:
-            await make_edge(text, output, s)
-        with output.open("rb") as audio:
-            await message.reply_audio(
-                audio=audio, filename=output.name, title=voice_label(voice)[:64],
-                caption=f"🎙️ {voice_label(voice)}",
-            )
+            await make_edge(text, out, s)
+        return out.read_bytes()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+async def send_demo(message, uid, voice):
+    try:
+        data = await demo_bytes(uid, voice)
+        await message.reply_audio(
+            audio=data, filename=f"demo_{safe_name(voice)}.mp3",
+            title=voice_label(voice)[:64], caption=f"🎙️ {voice_label(voice)}",
+        )
         return True
     except Exception as exc:
         log.exception("Demo failed for %s", voice)
         err = str(exc).replace(BOT_TOKEN, "[REDACTED]")[:300]
         await message.reply_text(f"Demo failed for {voice}: {type(exc).__name__}: {err}")
         return False
-    finally:
-        shutil.rmtree(folder, ignore_errors=True)
 
 
-def resolve_voice(arg):
-    key = arg.lower()
-    if key in VOICES:
-        return VOICES[key][0]
-    if VOICE_PATTERN.match(arg):
-        return arg
-    return None
-
-
-async def demo_all(message, uid):
-    """Send a demo for every voice, a few at a time to stay within rate limits."""
-    voices = [v for v, _ in VOICES.values()]
+async def demo_all(message, uid, voices=None):
+    """Send a demo for many voices, a few at a time to stay within rate limits."""
+    voices = voices or [v for v, _ in VOICES.values()]
     sem = asyncio.Semaphore(TTS_CONCURRENCY)
     status = await message.reply_text(f"🔊 Generating {len(voices)} demos…")
     done = 0
 
     async def one(voice):
-        nonlocal done
         async with sem:
-            data = await _demo_file(uid, voice)
-        return voice, data
-
-    async def _demo_file(uid_, voice):
-        folder = Path(tempfile.mkdtemp(prefix="tts-demo-", dir=WORK_ROOT))
-        try:
-            s = cfg(uid_).copy()
-            s["voice"] = voice
-            out = folder / f"demo_{safe_name(voice)}.mp3"
-            text = demo_text_for(voice)
-            if s["engine"] == "google":
-                await make_google(text, out, s)
-            else:
-                await make_edge(text, out, s)
-            return out.read_bytes()
-        except Exception as exc:
-            log.warning("Demo failed for %s: %s", voice, exc)
-            return None
-        finally:
-            shutil.rmtree(folder, ignore_errors=True)
+            try:
+                return await demo_bytes(uid, voice)
+            except Exception as exc:
+                log.warning("Demo failed for %s: %s", voice, exc)
+                return None
 
     tasks = [asyncio.create_task(one(v)) for v in voices]
     failed = []
     try:
         for voice, task in zip(voices, tasks):          # send in the listed order
-            _, data = await task
+            data = await task
             done += 1
             if data is None:
                 failed.append(voice)
@@ -842,12 +1079,16 @@ async def demo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if context.args:
         arg = context.args[0]
-        if arg.lower() == "all":
+        low = arg.lower()
+        if low == "all":
             await demo_all(message, uid)
+            return
+        if low not in VOICES and low in LANG_NAMES:
+            await demo_all(message, uid, [n for _, n, _ in voices_of_lang(low)])
             return
         voice = resolve_voice(arg)
         if not voice:
-            await message.reply_text("Unknown voice. Use /voices, /demo <name> or /demo all.")
+            await message.reply_text("Unknown voice. Use /voices, /demo <name>, /demo <lang> or /demo all.")
             return
     else:
         voice = cfg(uid)["voice"]
@@ -870,11 +1111,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu:refresh":
         await edit(settings_text(uid), settings_keyboard())
-    elif data == "menu:voice":
-        await edit("Choose voice (🔊 Demo plays a sample):", voice_keyboard())
+    elif data in {"menu:voice", "menu:lang"}:
+        await edit("🌐 Choose language:", lang_keyboard())
+    elif data.startswith("vl:"):
+        lang = data.split(":", 1)[1]
+        if lang in LANG_NAMES:
+            await edit(f"{LANG_NAMES[lang][0]} {LANG_NAMES[lang][1]} voices (🔊 Demo plays a sample):",
+                       voice_keyboard(lang))
+    elif data == "auto:toggle":
+        s["auto"] = not s.get("auto", True)
+        save_settings()
+        await edit(settings_text(uid), settings_keyboard())
     elif data == "demo:all":
         if msg:
             await demo_all(msg, uid)
+    elif data.startswith("demol:"):
+        lang = data.split(":", 1)[1]
+        if lang in LANG_NAMES and msg:
+            await demo_all(msg, uid, [n for _, n, _ in voices_of_lang(lang)])
     elif data.startswith("demo:"):
         key = data.split(":", 1)[1]
         if key in VOICES and msg:
@@ -1080,6 +1334,24 @@ async def send_skipped_report(message, uid, duration):
         log.exception("Could not send skipped-fragment report")
 
 
+def result_notes(uid):
+    """Extra lines for the final status message: fallbacks, skipped fragments, languages used."""
+    items = SKIPPED.get(uid, {}).get("items", [])
+    notes = ""
+    n_google = sum(1 for x in items if x.get("mode") == "google")
+    n_silent = sum(1 for x in items if x.get("mode", "silent") == "silent")
+    if n_google:
+        notes += f"\n🔁 {n_google} fragment(s) Edge refused were read with Google voice."
+    if n_silent:
+        notes += f"\n⚠ {n_silent} fragment(s) could NOT be spoken (list below)."
+    langs = LANGSTAT.get(uid, {})
+    if len(langs) > 1:
+        used = ", ".join(f"{LANG_NAMES.get(l, ('', l))[1]} ×{n}"
+                         for l, n in sorted(langs.items(), key=lambda kv: -kv[1]))
+        notes += f"\n🌐 Voices used (chunks): {used}"
+    return notes
+
+
 async def run_job(update, context, filename=None, text=None, settings=None):
     """Convert an uploaded file (filename) or pasted text (text) into audio."""
     message = update.effective_message
@@ -1135,18 +1407,14 @@ async def run_job(update, context, filename=None, text=None, settings=None):
                 part.unlink(missing_ok=True)
             PROGRESS[uid] = {"stage": "📤 Sending audio", "done": i, "total": len(parts), "started": started}
         elapsed = time.monotonic() - started
-        await safe_edit(status,
+        await safe_edit(
+            status,
             f"✅ Conversion complete!\n{progress_bar(len(parts), len(parts))} 100%\n"
             f"⏱ Used time: {fmt_time(elapsed)}\n"
             f"🎧 Audio duration: {fmt_time(duration)}\n"
             f"📦 Total audio size: {fmt_size(size_bytes)}\n"
             f"🎙️ Audio made: {len(parts)} file(s) sent."
-            + (lambda its: (
-                (f"\n🔁 {sum(1 for x in its if x.get('mode') == 'google')} fragment(s) Edge refused were read with Google voice."
-                 if any(x.get("mode") == "google" for x in its) else "")
-                + (f"\n⚠ {sum(1 for x in its if x.get('mode', 'silent') == 'silent')} fragment(s) could NOT be spoken (list below)."
-                   if any(x.get("mode", "silent") == "silent" for x in its) else "")
-            ))(SKIPPED.get(uid, {}).get("items", []))
+            + result_notes(uid),
         )
         await send_skipped_report(message, uid, duration)
     except asyncio.CancelledError:
@@ -1167,6 +1435,7 @@ async def run_job(update, context, filename=None, text=None, settings=None):
         shutil.rmtree(folder, ignore_errors=True)
         PROGRESS.pop(uid, None)
         SKIPPED.pop(uid, None)
+        LANGSTAT.pop(uid, None)
 
 
 # ───────────────────────── per-user job queue ─────────────────────────
@@ -1360,6 +1629,8 @@ def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
+    app.add_handler(CommandHandler("lang", lang_cmd))
+    app.add_handler(CommandHandler("auto", auto_cmd))
     app.add_handler(CommandHandler("voice", voice_cmd))
     app.add_handler(CommandHandler("voices", voices_cmd))
     app.add_handler(CommandHandler("rate", rate_cmd))
@@ -1378,8 +1649,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    log.info("Bot starting; local API=%s; target part size=%s MB; workers=%s",
-             LOCAL_BOT_API, SEND_PART_MB, TTS_CONCURRENCY)
+    log.info("Bot starting; local API=%s; target part size=%s MB; workers=%s; default voice=%s",
+             LOCAL_BOT_API, SEND_PART_MB, TTS_CONCURRENCY, DEFAULT_VOICE)
     app.run_polling(drop_pending_updates=False)
 
 
